@@ -23,6 +23,7 @@ import (
 
 type ECHPool struct {
 	wsServerAddr  string
+	hostName      string // wsServerAddr 的主机名，用作 -ip 未指定时的缓存键
 	connectionNum int
 	targetIPs     []string
 	clientID      string
@@ -39,8 +40,13 @@ func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 	if len(ips) > 0 {
 		total = len(ips) * n
 	}
+	hostName := ""
+	if u, err := url.Parse(addr); err == nil {
+		hostName = u.Hostname()
+	}
 	p := &ECHPool{
 		wsServerAddr:  addr,
+		hostName:      hostName,
 		connectionNum: n,
 		targetIPs:     ips,
 		clientID:      clientID,
@@ -49,6 +55,15 @@ func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 		channelCaps:   make([]uint64, total),
 	}
 	return p
+}
+
+// markHost 返回拨号缓存的主机键：优先 -ip 覆盖值（与 dialWebSocketWithECH 的键规则一致），
+// 否则退回服务地址主机名。
+func (p *ECHPool) markHost(ip string) string {
+	if strings.TrimSpace(ip) != "" {
+		return ip
+	}
+	return p.hostName
 }
 
 func (p *ECHPool) Start(ctx context.Context) {
@@ -92,6 +107,7 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		sess, err := smux.Client(wsNet, nil)
 		if err != nil {
 			_ = wsConn.Close()
+			globalDNSCache.ClearGood(p.markHost(ip))
 			if !sleepBeforeReconnect(fmt.Sprintf("smux 初始化失败: %v", err)) {
 				return
 			}
@@ -102,6 +118,9 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 			atomic.AddUint64(&clientProtocolFailureSeq, 1)
 			_ = sess.Close()
 			_ = wsConn.Close()
+			// 协商失败说明该端点 TCP 活着但隧道不可用：清除已验证标记，
+			// 让下一次重连回退系统解析器竞速换端点（防止钉死在协议层坏端点上）。
+			globalDNSCache.ClearGood(p.markHost(ip))
 			if !sleepBeforeReconnect(fmt.Sprintf("协议协商失败: %v", err)) {
 				return
 			}
@@ -109,6 +128,10 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		}
 		atomic.AddUint64(&clientProtocolOKSeq, 1)
 		log.Printf("[客户端] 通道 %d (IP:%s) v2 协议协商成功: version=2 caps=0x%x", chID, ipLabel, caps)
+		// v2 协商通过才算端点真正可用，此时才记录为已知可用 IP 供重连直连。
+		if ta, ok := wsConn.RemoteAddr().(*net.TCPAddr); ok && ta.IP != nil {
+			globalDNSCache.MarkGood(p.markHost(ip), ta.IP)
+		}
 		p.wsConnsMu.Lock()
 		p.smuxConns[idx] = sess
 		p.channelRTT[idx] = 0
@@ -633,44 +656,39 @@ func resolveWebSocketDialTarget(ctx context.Context, address, ip string) (string
 	return ip, port, nil
 }
 
-// dialCached 解析并拨号：字面量 IP 直连；主机名优先使用已知可用 IP 直连（命中缓存、
-// 跳过重复慢速 DNS），未命中则交由系统解析器（RFC6724 + Happy Eyeballs）选择正确端点，
-// 并将成功建链的 IP 记入缓存供后续重连直连。
+// dialCached 解析并拨号：字面量 IP 直连；主机名优先直连已知可用 IP（命中缓存、跳过重复
+// 慢速 DNS），未命中则交由系统解析器（RFC6724 + Happy Eyeballs）选择端点。
+// 注意：此处不记录 GoodIP——TCP 可达不代表隧道可用；只有上层 v2 协商验证成功后才由
+// dialAndServe 调用 MarkGood，避免把"协议层坏但 TCP 活着"的端点钉死在缓存里。
 func dialCached(ctx context.Context, network, host, port string) (net.Conn, error) {
 	if net.ParseIP(host) != nil {
 		d := net.Dialer{Timeout: cfg.DialTimeout}
-		return d.DialContext(ctx, network, net.JoinHostPort(host, port))
+		c, err := d.DialContext(ctx, network, net.JoinHostPort(host, port))
+		if err == nil {
+			log.Printf("[拨号] %s 字面量直连 %s", host, c.RemoteAddr())
+		}
+		return c, err
 	}
 	// 命中已知可用 IP：直连，避免重连风暴时反复付出慢速 DNS 代价
 	if goodIP := globalDNSCache.GoodIP(host); goodIP != nil {
 		d := net.Dialer{Timeout: cfg.DialTimeout}
-		if c, err := d.DialContext(ctx, network, net.JoinHostPort(goodIP.String(), port)); err == nil {
+		c, err := d.DialContext(ctx, network, net.JoinHostPort(goodIP.String(), port))
+		if err == nil {
+			log.Printf("[拨号] %s 缓存直连已验证端点 %s", host, c.RemoteAddr())
 			return c, nil
 		}
 		// 已知 IP 已 TCP 不可达：清除并回退系统解析器重新选择，避免卡死在死 IP 直到 TTL 过期
+		log.Printf("[拨号] %s 已验证端点 %s TCP 不可达，清除缓存回退系统解析器", host, goodIP)
 		globalDNSCache.ClearGood(host)
 	}
-	// 交由系统解析器选择可用端点（保证端点选择正确性）；成功后将所选 IP 记入缓存。
+	// 交由系统解析器选择可用端点（保证首次/回退时的正确端点选择）。
 	d := net.Dialer{Timeout: cfg.DialTimeout}
 	c, err := d.DialContext(ctx, network, net.JoinHostPort(host, port))
 	if err != nil {
 		return nil, err
 	}
-	if ip := goodIPFromConn(c); ip != nil {
-		globalDNSCache.MarkGood(host, ip)
-	}
+	log.Printf("[拨号] %s 经系统解析建链 %s", host, c.RemoteAddr())
 	return c, nil
-}
-
-// goodIPFromConn 从已建立的连接提取对端 IP（用于记录已知可用 IP）。
-func goodIPFromConn(c net.Conn) net.IP {
-	switch addr := c.RemoteAddr().(type) {
-	case *net.TCPAddr:
-		return addr.IP
-	case *net.UDPAddr:
-		return addr.IP
-	}
-	return nil
 }
 
 // preResolveDialTargets 在建立服务端连接前预热 -ip 域名的 DNS 缓存，

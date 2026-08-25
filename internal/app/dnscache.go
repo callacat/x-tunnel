@@ -13,8 +13,9 @@ import (
 type dnsCacheEntry struct {
 	ips     []net.IPAddr
 	expires time.Time
-	// goodIP 记录该主机最近一次成功建链的 IP（已知可用端点），供重连直连，跳过重复慢速 DNS。
-	// 仅在 TCP 建链成功后写入；TCP 不可达或上层握手失败时被 ClearGood 清除以回退系统解析器。
+	// goodIP 记录该主机最近一次通过 v2 协商验证的 IP（真正可用的隧道端点），
+	// 供重连直连，跳过重复慢速 DNS。由 dialAndServe 在协商成功后写入；
+	// TCP 不可达、WS 握手失败或上层协商失败时被 ClearGood 清除以回退系统解析器。
 	goodIP net.IP
 	// pending 表示正在解析中；waiters 为并发等待结果的通道（防击穿）。
 	pending bool
@@ -23,8 +24,8 @@ type dnsCacheEntry struct {
 
 // dnsCache 是一个线程安全、带 TTL 与防击穿的 DNS 解析缓存。
 // TTL 取自全局配置 cfg.DNSCacheTTL（<=0 表示禁用缓存，每次重新解析）。
-// 缓存全部解析结果避免重复慢速 DNS；并记录最近一次成功建链的 IP 供重连直连，
-// 端点失效（TCP 不可达或握手失败）时由 ClearGood 清除并回退系统解析器（Happy Eyeballs）。
+// 缓存全部解析结果避免重复慢速 DNS；并记录最近一次通过 v2 协商验证的可用 IP 供重连直连，
+// 端点失效（TCP 不可达、握手失败或协商失败）时由 ClearGood 清除并回退系统解析器（Happy Eyeballs）。
 type dnsCache struct {
 	mu      sync.Mutex
 	entries map[string]*dnsCacheEntry
@@ -100,9 +101,9 @@ func (c *dnsCache) GoodIP(host string) net.IP {
 	return e.goodIP
 }
 
-// MarkGood 记录主机 host 的成功建链 IP，供后续重连直连。
+// MarkGood 记录主机 host 通过 v2 协商验证的可用 IP，供后续重连直连。
 // 若缓存条目已过期/不存在则新建一条仅含该可用 IP 的轻量条目（不触发解析），
-// 保证“已知可用端点”在 TTL 内对后续重连可见。
+// 保证"已验证可用端点"在 TTL 内对后续重连可见。
 func (c *dnsCache) MarkGood(host string, ip net.IP) {
 	if ip == nil {
 		return
