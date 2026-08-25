@@ -12,10 +12,11 @@ import (
 // dnsCacheEntry 是单个主机的解析缓存项。
 type dnsCacheEntry struct {
 	ips     []net.IPAddr
+	rrIndex int // 候选轮询下标：系统解析器的首选可能是协议层坏端点（如 CF 边缘未回源），轮询让重连逐个尝试
 	expires time.Time
 	// goodIP 记录该主机最近一次通过 v2 协商验证的 IP（真正可用的隧道端点），
 	// 供重连直连，跳过重复慢速 DNS。由 dialAndServe 在协商成功后写入；
-	// TCP 不可达、WS 握手失败或上层协商失败时被 ClearGood 清除以回退系统解析器。
+	// TCP 不可达、WS 握手失败或上层协商失败时被 ClearGood 清除以回退候选轮询。
 	goodIP net.IP
 	// pending 表示正在解析中；waiters 为并发等待结果的通道（防击穿）。
 	pending bool
@@ -129,6 +130,29 @@ func (c *dnsCache) ClearGood(host string) {
 	if e, ok := c.entries[host]; ok {
 		e.goodIP = nil
 	}
+}
+
+// NextCandidate 返回该主机候选列表中轮询到的下一个 IP，并推进下标。
+// 若缓存中有有效列表则用缓存（调用方传入的 ips 仅用于首次填充/过期刷新）。
+// 目的：系统解析器的首选端点可能 TCP 可达但隧道不可用（协商 EOF），
+// 轮询让后续重连依次尝试其余候选，直到某个端点通过 v2 协商并被 MarkGood 锁定。
+func (c *dnsCache) NextCandidate(host string, ips []net.IPAddr) net.IP {
+	if len(ips) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[host]
+	if !ok || time.Now().After(e.expires) || len(e.ips) == 0 {
+		e = &dnsCacheEntry{ips: dupIPAddrs(ips), expires: time.Now().Add(cfg.DNSCacheTTL)}
+		c.entries[host] = e
+	}
+	if e.rrIndex >= len(e.ips) {
+		e.rrIndex = 0
+	}
+	ip := e.ips[e.rrIndex].IP
+	e.rrIndex = (e.rrIndex + 1) % len(e.ips)
+	return ip
 }
 
 // waitForResolve 等待发起者完成解析并取结果；发起者失败时递归重试一次。

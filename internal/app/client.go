@@ -656,38 +656,57 @@ func resolveWebSocketDialTarget(ctx context.Context, address, ip string) (string
 	return ip, port, nil
 }
 
-// dialCached 解析并拨号：字面量 IP 直连；主机名优先直连已知可用 IP（命中缓存、跳过重复
-// 慢速 DNS），未命中则交由系统解析器（RFC6724 + Happy Eyeballs）选择端点。
-// 注意：此处不记录 GoodIP——TCP 可达不代表隧道可用；只有上层 v2 协商验证成功后才由
-// dialAndServe 调用 MarkGood，避免把"协议层坏但 TCP 活着"的端点钉死在缓存里。
+// dialCached 解析并拨号：字面量 IP 直连；主机名按三级策略选端点——
+// ①已验证端点（v2 协商通过并 MarkGood 的 IP）直连；
+// ②无已验证端点时在解析结果候选间轮询（系统解析器首选可能是"TCP 活着但隧道坏"的
+//
+//	端点，如未正确回源的 CF 边缘；协商失败后下一次重连自动换下一个候选）；
+//
+// ③候选列表为空/解析失败时回退系统解析器。
+// GoodIP 仅由 dialAndServe 在 v2 协商成功后写入（TCP 可达≠隧道可用），失败路径负责清除。
 func dialCached(ctx context.Context, network, host, port string) (net.Conn, error) {
-	if net.ParseIP(host) != nil {
-		d := net.Dialer{Timeout: cfg.DialTimeout}
+	d := net.Dialer{Timeout: cfg.DialTimeout}
+	target := ""
+	switch {
+	case net.ParseIP(host) != nil:
+		target = host
+	default:
+		if goodIP := globalDNSCache.GoodIP(host); goodIP != nil {
+			if c, err := d.DialContext(ctx, network, net.JoinHostPort(goodIP.String(), port)); err == nil {
+				log.Printf("[拨号] %s 直连已验证端点 %s", host, goodIP)
+				return c, nil
+			} else {
+				// 已验证端点 TCP 不可达：清除标记，回退候选轮询
+				log.Printf("[拨号] %s 已验证端点 %s TCP 不可达，清除标记改用候选轮询", host, goodIP)
+				globalDNSCache.ClearGood(host)
+			}
+		}
+		ips, err := globalDNSCache.Resolve(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("解析 %q 失败: %w", host, err)
+		}
+		if len(ips) == 0 {
+			break
+		}
+		cand := globalDNSCache.NextCandidate(host, ips)
+		if cand == nil {
+			break
+		}
+		target = cand.String()
+	}
+	if target == "" {
+		// 无候选可用：交由系统解析器兜底
 		c, err := d.DialContext(ctx, network, net.JoinHostPort(host, port))
 		if err == nil {
-			log.Printf("[拨号] %s 字面量直连 %s", host, c.RemoteAddr())
+			log.Printf("[拨号] %s 经系统解析建链 %s", host, c.RemoteAddr())
 		}
 		return c, err
 	}
-	// 命中已知可用 IP：直连，避免重连风暴时反复付出慢速 DNS 代价
-	if goodIP := globalDNSCache.GoodIP(host); goodIP != nil {
-		d := net.Dialer{Timeout: cfg.DialTimeout}
-		c, err := d.DialContext(ctx, network, net.JoinHostPort(goodIP.String(), port))
-		if err == nil {
-			log.Printf("[拨号] %s 缓存直连已验证端点 %s", host, c.RemoteAddr())
-			return c, nil
-		}
-		// 已知 IP 已 TCP 不可达：清除并回退系统解析器重新选择，避免卡死在死 IP 直到 TTL 过期
-		log.Printf("[拨号] %s 已验证端点 %s TCP 不可达，清除缓存回退系统解析器", host, goodIP)
-		globalDNSCache.ClearGood(host)
-	}
-	// 交由系统解析器选择可用端点（保证首次/回退时的正确端点选择）。
-	d := net.Dialer{Timeout: cfg.DialTimeout}
-	c, err := d.DialContext(ctx, network, net.JoinHostPort(host, port))
+	c, err := d.DialContext(ctx, network, net.JoinHostPort(target, port))
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[拨号] %s 经系统解析建链 %s", host, c.RemoteAddr())
+	log.Printf("[拨号] %s 候选拨号 %s", host, target)
 	return c, nil
 }
 

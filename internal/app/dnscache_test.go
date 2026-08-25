@@ -63,3 +63,32 @@ func TestGoodIPExpiredImmediately(t *testing.T) {
 		t.Fatalf("TTL=0 时 GoodIP 应过期返回 nil，got %v", got)
 	}
 }
+
+// NextCandidate 应在候选列表间轮询推进，并在列表刷新后适配新长度。
+func TestNextCandidateRotates(t *testing.T) {
+	withDNSConfig(t, 5*time.Minute, time.Second)
+	c := &dnsCache{entries: make(map[string]*dnsCacheEntry)}
+	ips := []net.IPAddr{
+		{IP: net.ParseIP("203.0.113.1")},
+		{IP: net.ParseIP("203.0.113.2")},
+	}
+	want := []string{"203.0.113.1", "203.0.113.2", "203.0.113.1"}
+	for i, w := range want {
+		got := c.NextCandidate("rot.test", ips)
+		if got == nil || got.String() != w {
+			t.Fatalf("第 %d 次轮询 = %v, want %s", i+1, got, w)
+		}
+	}
+	// 缓存条目仍处 TTL 内时以缓存列表为准（生产中调用方列表即来自同一缓存），
+	// 轮询按原列表继续推进并回绕
+	if got := c.NextCandidate("rot.test", ips[:1]); got == nil || got.String() != "203.0.113.2" {
+		t.Fatalf("TTL 内应继续按缓存列表轮询 = %v, want 203.0.113.2", got)
+	}
+	// 条目过期后以新列表重建并从头轮询
+	c.mu.Lock()
+	c.entries["rot.test"].expires = time.Now().Add(-time.Second)
+	c.mu.Unlock()
+	if got := c.NextCandidate("rot.test", ips[:1]); got == nil || got.String() != "203.0.113.1" {
+		t.Fatalf("过期重建后应从头轮询 = %v, want 203.0.113.1", got)
+	}
+}
