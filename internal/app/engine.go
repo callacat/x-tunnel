@@ -220,6 +220,7 @@ func (e *Engine) startRuntime() error {
 	log.Printf("[客户端] 客户端ID: %s", clientID)
 
 	echPool = NewECHPool(e.config.values.ForwardAddr, e.config.values.ConnectionNum, startup.TargetIPs, clientID)
+	preResolveDialTargets(startup)
 	echPool.Start(e.ctx)
 
 	for _, listenerRule := range startup.Listeners {

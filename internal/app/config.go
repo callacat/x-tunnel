@@ -35,6 +35,7 @@ type GlobalConfig struct {
 	ShutdownTimeout    time.Duration
 	AuthSkew           time.Duration
 	PreAuthTimeout     time.Duration
+	DNSCacheTTL        time.Duration
 
 	ReadBuf int
 }
@@ -53,6 +54,7 @@ func defaultGlobalConfig() GlobalConfig {
 		ShutdownTimeout:    5 * time.Second,
 		AuthSkew:           5 * time.Minute,
 		PreAuthTimeout:     5 * time.Second,
+		DNSCacheTTL:        5 * time.Minute,
 		ReadBuf:            64 * 1024,
 	}
 }
@@ -256,6 +258,7 @@ func init() {
 	flag.DurationVar(&cfg.ReconnectJitter, "reconnect-jitter", cfg.ReconnectJitter, "客户端重连随机抖动上限")
 	flag.DurationVar(&cfg.RTTProbeTimeout, "rtt-timeout", cfg.RTTProbeTimeout, "通道 RTT 探测超时时间")
 	flag.DurationVar(&cfg.DNSQueryTimeout, "dns-timeout", cfg.DNSQueryTimeout, "ECH DNS 查询超时时间")
+	flag.DurationVar(&cfg.DNSCacheTTL, "dns-cache-ttl", cfg.DNSCacheTTL, "服务端/-ip 主机解析结果缓存时长（0=禁用缓存）")
 	flag.DurationVar(&cfg.ECHRetryDelay, "ech-retry-delay", cfg.ECHRetryDelay, "ECH 查询/刷新失败后的重试等待时间")
 	flag.DurationVar(&cfg.UDPReadTimeout, "udp-read-timeout", cfg.UDPReadTimeout, "服务端 UDP relay 读轮询超时时间")
 	flag.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", cfg.ShutdownTimeout, "收到退出信号后的优雅关闭超时时间")
@@ -309,6 +312,7 @@ type FileConfig struct {
 	ReconnectJitter     *string                    `json:"reconnect_jitter"`
 	RTTProbeTimeout     *string                    `json:"rtt_timeout"`
 	DNSQueryTimeout     *string                    `json:"dns_timeout"`
+	DNSCacheTTL         *string                    `json:"dns_cache_ttl"`
 	ECHRetryDelay       *string                    `json:"ech_retry_delay"`
 	UDPReadTimeout      *string                    `json:"udp_read_timeout"`
 	ShutdownTimeout     *string                    `json:"shutdown_timeout"`
@@ -639,6 +643,9 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	if err := applyDurationConfig(seen, "dns-timeout", fc.DNSQueryTimeout, &values.Global.DNSQueryTimeout); err != nil {
 		return err
 	}
+	if err := applyNonNegativeDurationConfig(seen, "dns-cache-ttl", fc.DNSCacheTTL, &values.Global.DNSCacheTTL); err != nil {
+		return err
+	}
 	if err := applyDurationConfig(seen, "ech-retry-delay", fc.ECHRetryDelay, &values.Global.ECHRetryDelay); err != nil {
 		return err
 	}
@@ -871,12 +878,16 @@ func validateDialIPOverride(value string) error {
 			return fmt.Errorf("port 必须在 1-65535 之间")
 		}
 		if net.ParseIP(host) == nil {
-			return fmt.Errorf("host 必须是 IP 地址")
+			if err := validateDNSName(host); err != nil {
+				return fmt.Errorf("host 必须是 IP 地址或合法主机名: %w", err)
+			}
 		}
 		return nil
 	}
 	if net.ParseIP(value) == nil {
-		return fmt.Errorf("必须是 IP 地址或 IP:port")
+		if err := validateDNSName(value); err != nil {
+			return fmt.Errorf("必须是 IP 地址、IP:port 或合法主机名: %w", err)
+		}
 	}
 	return nil
 }

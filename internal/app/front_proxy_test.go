@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -491,16 +492,16 @@ func TestResolveWebSocketDialTarget(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveWebSocketDialTarget(tt.address, tt.ip)
+			gotHost, gotPort, err := resolveWebSocketDialTarget(context.Background(), tt.address, tt.ip)
 			if err != nil {
 				t.Fatalf("resolveWebSocketDialTarget returned error: %v", err)
 			}
-			if got != tt.want {
+			if got := net.JoinHostPort(gotHost, gotPort); got != tt.want {
 				t.Fatalf("resolveWebSocketDialTarget = %q, want %q", got, tt.want)
 			}
 		})
 	}
-	if _, err := resolveWebSocketDialTarget("example.com", "127.0.0.1"); err == nil {
+	if _, _, err := resolveWebSocketDialTarget(context.Background(), "example.com", "127.0.0.1"); err == nil {
 		t.Fatal("resolveWebSocketDialTarget accepted address without port")
 	}
 }

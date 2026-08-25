@@ -1857,7 +1857,7 @@ func TestValidateStartupConfigRejectsCommonErrors(t *testing.T) {
 		setup func()
 	}{
 		{name: "bad metrics", setup: func() { metricsAddr = "127.0.0.1" }},
-		{name: "bad ip override", setup: func() { ipAddr = "example.com" }},
+		{name: "bad ip override", setup: func() { ipAddr = "example.com:70000" }},
 		{name: "bad ip strategy", setup: func() { ips = "4,4" }},
 		{name: "missing client forward", setup: func() { forwardAddr = "" }},
 		{name: "bad forward scheme", setup: func() { forwardAddr = "http://127.0.0.1:18080/tunnel" }},
@@ -1901,7 +1901,7 @@ func TestValidateDialIPOverride(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"example.com", "127.0.0.1:0", "127.0.0.1:70000", "[2001:db8::1]:0"}
+	invalid := []string{"127.0.0.1:0", "127.0.0.1:70000", "[2001:db8::1]:0"}
 	for _, value := range invalid {
 		if err := validateDialIPOverride(value); err == nil {
 			t.Fatalf("validateDialIPOverride(%q) accepted invalid override", value)

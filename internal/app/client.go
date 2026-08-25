@@ -536,6 +536,13 @@ func dialWebSocketWithECH(addr string, retries int, ip string) (*websocket.Conn,
 	dialURL.RawQuery = ""
 	dialAddr := dialURL.String()
 
+	// markHost 是与拨号缓存对应的主机键：优先用 -ip 覆盖值，否则用目标主机名。
+	// 握手失败时据此清除 GoodIP，迫使重试用系统解析器换端点。
+	markHost := ip
+	if markHost == "" {
+		markHost = u.Hostname()
+	}
+
 	newDialer := func() websocket.Dialer {
 		dialer := websocket.Dialer{
 			HandshakeTimeout: cfg.WSHandshakeTimeout,
@@ -544,15 +551,14 @@ func dialWebSocketWithECH(addr string, retries int, ip string) (*websocket.Conn,
 		}
 		if ip != "" || frontProxyEnabled() {
 			dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-				target, err := resolveWebSocketDialTarget(address, ip)
+				host, port, err := resolveWebSocketDialTarget(ctx, address, ip)
 				if err != nil {
 					return nil, err
 				}
 				if frontProxyEnabled() {
-					return dialWebSocketFrontProxy(ctx, target)
+					return dialWebSocketFrontProxy(ctx, net.JoinHostPort(host, port))
 				}
-				d := net.Dialer{Timeout: cfg.DialTimeout}
-				return d.DialContext(ctx, network, target)
+				return dialCached(ctx, network, host, port)
 			}
 		}
 		return dialer
@@ -565,6 +571,7 @@ func dialWebSocketWithECH(addr string, retries int, ip string) (*websocket.Conn,
 			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 				return nil, fmt.Errorf("认证失败")
 			}
+			globalDNSCache.ClearGood(markHost)
 			return nil, err
 		}
 		return conn, nil
@@ -595,6 +602,7 @@ func dialWebSocketWithECH(addr string, retries int, ip string) (*websocket.Conn,
 				time.Sleep(cfg.ECHRetryDelay)
 				continue
 			}
+			globalDNSCache.ClearGood(markHost)
 			return nil, err
 		}
 		return conn, nil
@@ -602,18 +610,87 @@ func dialWebSocketWithECH(addr string, retries int, ip string) (*websocket.Conn,
 	return nil, fmt.Errorf("连接失败")
 }
 
-func resolveWebSocketDialTarget(address, ip string) (string, error) {
+func resolveWebSocketDialTarget(ctx context.Context, address, ip string) (string, string, error) {
 	if ip == "" {
-		return address, nil
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return "", "", fmt.Errorf("解析 WebSocket 目标地址失败 %q: %w", address, err)
+		}
+		return host, port, nil
 	}
 	_, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return "", fmt.Errorf("解析 WebSocket 目标地址失败 %q: %w", address, err)
+		return "", "", fmt.Errorf("解析 WebSocket 目标地址失败 %q: %w", address, err)
 	}
 	if host, overridePort, err := net.SplitHostPort(ip); err == nil {
-		return net.JoinHostPort(host, overridePort), nil
+		return host, overridePort, nil
 	}
-	return net.JoinHostPort(ip, port), nil
+	if net.ParseIP(ip) != nil {
+		return ip, port, nil
+	}
+	// -ip 为域名（如 CF 优选域名）：返回主机名，交由 dialCached 通过缓存解析并 Happy Eyeballs 拨号，
+	// 既避免每次重连重复慢速 DNS，又保留系统解析器对可用端点的选择能力。
+	return ip, port, nil
+}
+
+// dialCached 解析并拨号：字面量 IP 直连；主机名优先使用已知可用 IP 直连（命中缓存、
+// 跳过重复慢速 DNS），未命中则交由系统解析器（RFC6724 + Happy Eyeballs）选择正确端点，
+// 并将成功建链的 IP 记入缓存供后续重连直连。
+func dialCached(ctx context.Context, network, host, port string) (net.Conn, error) {
+	if net.ParseIP(host) != nil {
+		d := net.Dialer{Timeout: cfg.DialTimeout}
+		return d.DialContext(ctx, network, net.JoinHostPort(host, port))
+	}
+	// 命中已知可用 IP：直连，避免重连风暴时反复付出慢速 DNS 代价
+	if goodIP := globalDNSCache.GoodIP(host); goodIP != nil {
+		d := net.Dialer{Timeout: cfg.DialTimeout}
+		if c, err := d.DialContext(ctx, network, net.JoinHostPort(goodIP.String(), port)); err == nil {
+			return c, nil
+		}
+		// 已知 IP 已 TCP 不可达：清除并回退系统解析器重新选择，避免卡死在死 IP 直到 TTL 过期
+		globalDNSCache.ClearGood(host)
+	}
+	// 交由系统解析器选择可用端点（保证端点选择正确性）；成功后将所选 IP 记入缓存。
+	d := net.Dialer{Timeout: cfg.DialTimeout}
+	c, err := d.DialContext(ctx, network, net.JoinHostPort(host, port))
+	if err != nil {
+		return nil, err
+	}
+	if ip := goodIPFromConn(c); ip != nil {
+		globalDNSCache.MarkGood(host, ip)
+	}
+	return c, nil
+}
+
+// goodIPFromConn 从已建立的连接提取对端 IP（用于记录已知可用 IP）。
+func goodIPFromConn(c net.Conn) net.IP {
+	switch addr := c.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		return addr.IP
+	case *net.UDPAddr:
+		return addr.IP
+	}
+	return nil
+}
+
+// preResolveDialTargets 在建立服务端连接前预热 -ip 域名的 DNS 缓存，
+// 让首次拨号即命中缓存，并提前暴露解析异常。失败不阻断启动，由重连逻辑兜底。
+func preResolveDialTargets(startup *startupConfig) {
+	if startup == nil {
+		return
+	}
+	for _, tip := range startup.TargetIPs {
+		host := tip
+		if h, _, err := net.SplitHostPort(tip); err == nil {
+			host = h
+		}
+		if net.ParseIP(host) != nil {
+			continue
+		}
+		if _, err := globalDNSCache.Resolve(context.Background(), host); err != nil {
+			log.Printf("[客户端] 预解析 -ip 主机 %q 失败（启动后仍会重试）: %v", host, err)
+		}
+	}
 }
 
 // ======================== SOCKS5 / HTTP Proxy ========================
