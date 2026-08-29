@@ -656,7 +656,7 @@ func requestServerName(r *http.Request) string {
 func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serverName string, path string) {
 	netConn := newWSNetConn(wsConn)
 	_ = netConn.SetDeadline(time.Now().Add(cfg.PreAuthTimeout))
-	sess, err := smux.Server(netConn, nil)
+	sess, err := smux.Server(netConn, newSmuxConfig())
 	if err != nil {
 		_ = wsConn.Close()
 		log.Printf("[服务端] v3 预认证 smux 初始化失败: %v", err)
@@ -861,7 +861,7 @@ func handleAuthenticatedSmuxSession(ch *WSChannel, sess *smux.Session) {
 
 func handleWebSocketChannel(ch *WSChannel) {
 	netConn := newWSNetConn(ch.conn)
-	sess, err := smux.Server(netConn, nil)
+	sess, err := smux.Server(netConn, newSmuxConfig())
 	if err != nil {
 		log.Printf("[服务端] 通道 %d smux 初始化失败: %v", ch.id, err)
 		_ = ch.conn.Close()

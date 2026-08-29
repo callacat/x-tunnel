@@ -1699,7 +1699,7 @@ func TestClassifyListeners(t *testing.T) {
 }
 
 func TestValidateClientStartupConfig(t *testing.T) {
-	cfg, err := validateClientStartupConfig("wss://example.com/tunnel", 2, "client.pem", "client-key.pem", true, false, "443,8443")
+	cfg, err := validateClientStartupConfig("wss://example.com/tunnel", 2, "client.pem", "client-key.pem", true, false, true, "443,8443")
 	if err != nil {
 		t.Fatalf("validateClientStartupConfig returned error: %v", err)
 	}
@@ -1727,7 +1727,7 @@ func TestValidateClientStartupConfig(t *testing.T) {
 	}
 	for _, tt := range invalid {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := validateClientStartupConfig(tt.forward, tt.n, tt.cert, tt.key, false, false, tt.block); err == nil {
+			if _, err := validateClientStartupConfig(tt.forward, tt.n, tt.cert, tt.key, false, false, false, tt.block); err == nil {
 				t.Fatal("validateClientStartupConfig accepted invalid input")
 			}
 		})
@@ -1779,6 +1779,10 @@ func withValidStartupGlobals(t *testing.T) func() {
 	oldAllowHosts, oldDenyHosts := targetAllowHosts, targetDenyHosts
 	oldMaxClients, oldMaxStreams := maxClientSessions, maxStreamsPerClient
 	oldConnections, oldInsecure, oldFallback := connectionNum, insecure, fallback
+	oldEnableECH := enableECH
+	oldCipherPref := cipherPrefStr
+	oldPacing := pacingRateMbps
+	oldShaping := shapingCoalesceMs
 	oldIPS := ips
 	oldDNS, oldECH := dnsServer, echDomain
 
@@ -1808,6 +1812,10 @@ func withValidStartupGlobals(t *testing.T) func() {
 		targetAllowHosts, targetDenyHosts = oldAllowHosts, oldDenyHosts
 		maxClientSessions, maxStreamsPerClient = oldMaxClients, oldMaxStreams
 		connectionNum, insecure, fallback = oldConnections, oldInsecure, oldFallback
+		enableECH = oldEnableECH
+		cipherPrefStr = oldCipherPref
+		pacingRateMbps = oldPacing
+		shapingCoalesceMs = oldShaping
 		ips = oldIPS
 		dnsServer, echDomain = oldDNS, oldECH
 	}
@@ -1875,11 +1883,13 @@ func TestValidateStartupConfigRejectsCommonErrors(t *testing.T) {
 		}},
 		{name: "bad ech dns config", setup: func() {
 			forwardAddr = "wss://example.com/tunnel"
+			enableECH = true
 			fallback = false
 			echDomain = "bad host.example"
 		}},
 		{name: "bad dns server config", setup: func() {
 			forwardAddr = "wss://example.com/tunnel"
+			enableECH = true
 			fallback = false
 			dnsServer = "ftp://dns.example.com"
 		}},

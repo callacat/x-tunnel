@@ -1,6 +1,6 @@
 # x-tunnel Protocol Specification
 
-Status: Protocol v3 (P0 + P1 implemented; all-AEAD, ephemeral X25519 forward secrecy, server proof, sliding replay window, TAI64N anti-replay, first-packet morphing, per-record padding, and traffic shaping).
+Status: Protocol v3 (P0 + P1 + P2 implemented; all-AEAD, ephemeral X25519 forward secrecy, server proof, sliding replay window, TAI64N anti-replay, first-packet morphing, per-record padding, traffic shaping, smux keepalive randomization, send pacing, ECH default off/configurable, and configurable cipher preference).
 
 This document describes the wire behavior implemented in `internal/wire` and
 used by `cmd/x-tunnel`. Current builds negotiate and enforce protocol v3
@@ -47,9 +47,11 @@ The outer transport is WebSocket over TCP or TLS:
 - `ws://`
 - `wss://`
 
-For `wss://`, the client uses TLS 1.3. ECH can be enabled by default and
-disabled with fallback mode. `-insecure` disables certificate verification for
-standard TLS fallback behavior and should not be used in production.
+For `wss://`, the client uses TLS 1.3. ECH is disabled by default because it is
+currently targeted and blocked by the GFW (acting as a red flag); it can be
+explicitly enabled via configuration (`-ech`). Fallback to standard TLS 1.3 is preserved.
+`-insecure` disables certificate verification for standard TLS fallback behavior and
+should not be used in production.
 
 The WebSocket request does not carry protocol metadata:
 
@@ -287,6 +289,12 @@ To prevent protocol fingerprinting and timing oracles, any failure during pre-au
 
 - **P0 (Implemented)**: All-AEAD cipher suite (ChaCha20-Poly1305, AES-256-GCM, AES-128-GCM), transcript-bound authentication & anti-downgrade proofs, per-stream AEAD framing with 2048-bit sliding replay window and automatic generation rekey.
 - **P1 (Implemented)**: Ephemeral X25519 forward secrecy, dual transcript hashes, server proof validation, `ForwardSecrecy` capability enforcement, WireGuard-style TAI64N monotonic anti-replay with bounded LRU cache, external silent drop, ChannelInit first-packet morphing padding across 3 confidence bands, and per-record uniform padding with configurable segment coalescing. Coalescing defaults to 0 (disabled) to preserve low interactive latency, but can be enabled for strict packet-size shaping.
+- **P2 (Implemented)**: Application layer traffic shaping & fingerprint mitigation:
+  - Keepalive randomization with ±20% uniform jitter on smux sessions (default enabled, anti-periodic fingerprint).
+  - Optional token bucket send pacing (`-pacing-rate-mbps`, default 0 / disabled for zero overhead).
+  - ECH default off / configurable (`-ech` bool flag default false, `-ech-domain` string, rationale: GFW targeted blocking).
+  - Configurable client cipher preference (`-cipher-pref`, default "1,2,3", validated against supported ciphers, fail closed on error).
+  - Segmentation coalescing switch wiring (`-shaping-coalesce-ms`, default 0 / disabled to avoid adding interactive latency; ping probe streams keep 0 delay to avoid RTT measurement distortion).
 - **Remaining Items**:
   - Dual-stack QUIC / HTTP/3 transport alongside WebSocket/TCP.
 

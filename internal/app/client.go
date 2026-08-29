@@ -112,7 +112,7 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 			continue
 		}
 		wsNet := newWSNetConn(wsConn)
-		sess, err := smux.Client(wsNet, nil)
+		sess, err := smux.Client(wsNet, newSmuxConfig())
 		if err != nil {
 			_ = wsConn.Close()
 			if !sleepBeforeReconnect(fmt.Sprintf("smux 初始化失败: %v", err)) {
@@ -287,7 +287,7 @@ func negotiateClientProtocol(sess *smux.Session, timeout time.Duration, clientID
 		ClientNonce:  nonce,
 		Timestamp:    now.Unix(),
 		Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
-		CipherPref:   defaultCipherPreference,
+		CipherPref:   clientCipherPreference(),
 		ClientEphPK:  clientPk,
 		TAI64N:       encodeTAI64N(now),
 	}
@@ -446,7 +446,11 @@ func webSocketRequestHeader() http.Header {
 func proxyConnStream(c net.Conn, stream io.ReadWriteCloser) {
 	done := make(chan struct{}, 2)
 	go func() {
-		n, _ := io.Copy(stream, c)
+		var dst io.Writer = stream
+		if pacingRateMbps > 0 {
+			dst = newPacerWriterMbps(stream, pacingRateMbps)
+		}
+		n, _ := io.Copy(dst, c)
 		if n > 0 {
 			atomic.AddUint64(&runtimeBytesSentSeq, uint64(n))
 		}
@@ -555,6 +559,9 @@ func (p *ECHPool) openTCPStream(target string) (*V3CipherStream, int, int, error
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
+	if shapingCoalesceMs > 0 {
+		cs.CoalesceDelay = time.Duration(shapingCoalesceMs) * time.Millisecond
+	}
 	if err := writeSmuxOpenHeader(cs, streamKindTCP, ipStrategy, target); err != nil {
 		_ = cs.Close()
 		return nil, 0, 0, err
@@ -589,6 +596,9 @@ func (p *ECHPool) openUDPStream(target string) (*V3CipherStream, int, int, error
 	if err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
+	}
+	if shapingCoalesceMs > 0 {
+		cs.CoalesceDelay = time.Duration(shapingCoalesceMs) * time.Millisecond
 	}
 	if err := writeSmuxOpenHeader(cs, streamKindUDP, ipStrategy, target); err != nil {
 		_ = cs.Close()
