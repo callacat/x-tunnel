@@ -124,15 +124,33 @@ func (e *Engine) initRouteEngine() error {
 		}
 	}
 
-	// 异步首次 GEO 下载（失败只 warning，不阻塞启动；更新走控制 API 手动触发）。
+	// 异步首次 GEO 下载。重试 3 次（间隔 5s）：启动期本机 SOCKS5 listener 可能
+	// 还未 bind（下载经隧道代理），立即发必失败；重试窗口覆盖 listener 就绪。
+	// 失败只 warning，不阻塞启动；后续可经 /v1/route/geo/update 手动重试。
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if updated, err := engine.UpdateGeo(ctx); err != nil {
-			log.Printf("[分流] GEO 数据库首次下载失败（降级 rules-only）：%v", err)
-		} else if updated {
-			log.Printf("[分流] GEO 数据库已更新")
+		const attempts = 3
+		var lastErr error
+		for i := 1; i <= attempts; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			updated, err := engine.UpdateGeo(ctx)
+			cancel()
+			if err == nil {
+				if updated {
+					log.Printf("[分流] GEO 数据库已更新（第 %d 次尝试）", i)
+				} else {
+					log.Printf("[分流] GEO 数据库已就绪（已是最新）")
+				}
+				return
+			}
+			lastErr = err
+			log.Printf("[分流] GEO 数据库下载失败（第 %d/%d 次，降级 rules-only）：%v", i, attempts, err)
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
 		}
+		_ = lastErr
 	}()
 	return nil
 }
