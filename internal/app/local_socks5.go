@@ -311,6 +311,20 @@ func handleSOCKS5UserPassAuth(c net.Conn, cfgp *ProxyConfig) error {
 }
 
 func handleSOCKS5Connect(c net.Conn, target string) {
+	// 分流判定（§1.2）：host 拆端口供 Match；ATYP=域名直用，IP 字面量先查
+	// DNS 嗅探映射还原域名（§2.2），miss 则只走 geoip。
+	host, _, _ := net.SplitHostPort(target)
+	routeHost, routeIP := routeRT.resolveHostForRoute(host)
+	switch decideForTarget(routeHost, routeIP) {
+	case routeDirect:
+		handleDirectConnect(c, target)
+		return
+	case routeReject:
+		_ = writeSOCKS5Reply(c, 0x02)
+		_ = c.Close()
+		return
+	}
+
 	stream, _, decision, err := echPool.openTCPStream(target)
 	if err != nil {
 		log.Printf("[客户端] %s SOCKS5 打开失败 %s: %v", clientSourceAddr(c), target, err)
@@ -472,6 +486,16 @@ func (a *UDPAssociation) handleUDPResponse(addrStr string, data []byte) {
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return
+	}
+	// §2.2 DNS 嗅探：响应侧从 DNS 报文提取 QNAME + A/AAAA 答案，写入 IP→域名
+	// 映射（routeRT.remember），使后续 SOCKS5/HTTP 的 IP 字面量目标能反查域名
+	// 命中 geosite/domain 规则。旁路观察，不改动数据流；引擎未启用时跳过。
+	if routeRT.engineSnapshot() != nil && port == 53 {
+		if qname, ips := sniffDNSAnswers(data); qname != "" {
+			for _, ip := range ips {
+				rememberHostFromDNS(ip, qname)
+			}
+		}
 	}
 	pkt, err := buildSOCKS5UDPPacket(host, port, data)
 	if err != nil {

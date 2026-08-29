@@ -327,10 +327,10 @@ func TestMatchReject(t *testing.T) {
 		wantAct     string
 		wantMatched bool
 	}{
-		{"ads.com", "reject", true},        // REJECT 首条命中
-		{"cdn.ads.com", "reject", true},    // 子域
-		{"google.com", "proxy", true},      // 后续规则仍生效
-		{"example.org", "direct", false},   // 未命中兜底 direct
+		{"ads.com", "reject", true},      // REJECT 首条命中
+		{"cdn.ads.com", "reject", true},  // 子域
+		{"google.com", "proxy", true},    // 后续规则仍生效
+		{"example.org", "direct", false}, // 未命中兜底 direct
 	}
 	for _, tc := range cases {
 		act, _, matched := e.Match(tc.host, netip.Addr{})

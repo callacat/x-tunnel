@@ -43,10 +43,10 @@ type Engine struct {
 
 	stopWatch func() // WatchRulesFile 返回的停止函数，Close 时调用
 
-	statsProxy   atomic.Int64
-	statsDirect  atomic.Int64
-	statsReject  atomic.Int64
-	statsMiss    atomic.Int64
+	statsProxy  atomic.Int64
+	statsDirect atomic.Int64
+	statsReject atomic.Int64
+	statsMiss   atomic.Int64
 }
 
 // Match 判定 (host, ip) 的转发行为。
