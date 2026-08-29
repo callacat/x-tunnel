@@ -84,6 +84,12 @@ type WSChannel struct {
 	conn         *websocket.Conn
 	session      *ClientSession
 	capabilities uint64
+	v3Keys       V3SessionKeys
+	v3Cipher     byte
+}
+
+func wrapV3DataStream(ch *WSChannel, stream *smux.Stream) (*V3CipherStream, error) {
+	return newV3CipherStream(stream, ch.v3Keys, ch.v3Cipher, stream.ID(), false)
 }
 
 type ClientSession struct {
@@ -648,7 +654,7 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	sess, err := smux.Server(netConn, nil)
 	if err != nil {
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 预认证 smux 初始化失败: %v", err)
+		log.Printf("[服务端] v3 预认证 smux 初始化失败: %v", err)
 		return
 	}
 	defer sess.Close()
@@ -657,68 +663,95 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	if err != nil {
 		_ = wsConn.Close()
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		log.Printf("[服务端] v2 预认证等待 ChannelInit 失败: %v", err)
+		log.Printf("[服务端] v3 预认证等待 ChannelInit 失败: %v", err)
 		return
 	}
 	defer stream.Close()
 	_ = stream.SetDeadline(time.Now().Add(cfg.PreAuthTimeout))
-	init, err := readChannelInit(stream, maxV2FrameSize)
+	init, err := readChannelInitV3(stream, maxV2FrameSize)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = writeChannelReject(stream, ChannelReject{Code: v2RejectMalformedFrame, Message: "malformed ChannelInit"})
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectMalformedFrame, Message: "malformed ChannelInit"})
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 ChannelInit 读取失败: %v", err)
+		log.Printf("[服务端] v3 ChannelInit 读取失败: %v", err)
 		return
 	}
 	now := time.Now()
 	if !validateChannelInitTime(now, init.Timestamp, cfg.AuthSkew) {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = writeChannelReject(stream, ChannelReject{Code: v2RejectTimestampSkew, Message: "timestamp skew"})
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectTimestampSkew, Message: "timestamp skew"})
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 ChannelInit 时间戳拒绝，来源 IP: %s", clientIP)
+		log.Printf("[服务端] v3 ChannelInit 时间戳拒绝，来源 IP: %s", clientIP)
 		return
 	}
-	if !verifyV2AuthProof(token, serverName, path, init) {
+	if !verifyV3AuthProof(token, serverName, path, init) {
 		atomic.AddUint64(&serverAuthRejectSeq, 1)
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = writeChannelReject(stream, ChannelReject{Code: v2RejectAuthenticationFailed, Message: "auth proof invalid"})
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectAuthenticationFailed, Message: "auth proof invalid"})
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 认证失败，来源 IP: %s", clientIP)
+		log.Printf("[服务端] v3 认证失败，来源 IP: %s", clientIP)
 		return
 	}
 	if serverNonceCache.seenOrStore(init.SessionID, init.ChannelID, init.ClientNonce, now, cfg.AuthSkew) {
 		atomic.AddUint64(&serverProtocolReplaySeq, 1)
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = writeChannelReject(stream, ChannelReject{Code: v2RejectReplayDetected, Message: "nonce replay"})
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectReplayDetected, Message: "nonce replay"})
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 ChannelInit nonce 重放，来源 IP: %s", clientIP)
+		log.Printf("[服务端] v3 ChannelInit nonce 重放，来源 IP: %s", clientIP)
 		return
 	}
 	caps, rejectCode, rejectMessage := negotiateProtocolCapabilitiesV2(init.Capabilities)
 	if rejectCode != 0 {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = writeChannelReject(stream, ChannelReject{Code: rejectCode, Message: rejectMessage})
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: rejectCode, Message: rejectMessage})
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 协议能力拒绝: %s", rejectMessage)
+		log.Printf("[服务端] v3 协议能力拒绝: %s", rejectMessage)
+		return
+	}
+	chosenCipher, cipherRejectCode, cipherRejectMsg := negotiateCipherV3(init.CipherPref)
+	if cipherRejectCode != 0 {
+		atomic.AddUint64(&serverProtocolRejectSeq, 1)
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: cipherRejectCode, Message: cipherRejectMsg})
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 加密套件拒绝: %s", cipherRejectMsg)
 		return
 	}
 	sessionID := hex.EncodeToString(init.SessionID)
 	session, ok := getOrCreateClientSession(sessionID)
 	if !ok {
 		atomic.AddUint64(&serverClientRejectSeq, 1)
-		_ = writeChannelReject(stream, ChannelReject{Code: v2RejectResourceLimit, Message: "max clients reached"})
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectResourceLimit, Message: "max clients reached"})
 		_ = wsConn.Close()
-		log.Printf("[服务端] 拒绝 v2 客户端会话: session=%s max-clients=%d", shortID(sessionID), maxClientSessions)
+		log.Printf("[服务端] 拒绝 v3 客户端会话: session=%s max-clients=%d", shortID(sessionID), maxClientSessions)
+		return
+	}
+	th, err := computeV3TranscriptHash(serverName, path, init)
+	if err != nil {
+		atomic.AddUint64(&serverProtocolFailureSeq, 1)
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectMalformedFrame, Message: "transcript hash failed"})
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 计算 transcript hash 失败: %v", err)
+		return
+	}
+	keys, err := deriveV3SessionKeys(token, th)
+	if err != nil {
+		atomic.AddUint64(&serverProtocolFailureSeq, 1)
+		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectMalformedFrame, Message: "kdf failed"})
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 派生会话密钥失败: %v", err)
 		return
 	}
 	ch := session.addChannel(wsConn, uint64(init.ChannelID))
 	atomic.StoreUint64(&ch.capabilities, caps)
+	ch.v3Keys = keys
+	ch.v3Cipher = chosenCipher
+
 	serverNonce := make([]byte, 32)
 	if _, err := rand.Read(serverNonce); err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		session.removeChannel(ch.id, ch)
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 server nonce 生成失败: %v", err)
+		log.Printf("[服务端] v3 server nonce 生成失败: %v", err)
 		return
 	}
 	accept := ChannelAccept{
@@ -726,19 +759,20 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 		ServerNonce:  serverNonce,
 		ServerTime:   now.Unix(),
 		MaxFrameSize: maxV2FrameSize,
+		Cipher:       chosenCipher,
 	}
 	if maxStreamsPerClient > 0 {
 		accept.MaxStreams = uint32(maxStreamsPerClient)
 	}
-	if err := writeChannelAccept(stream, accept); err != nil {
+	if err := writeChannelAcceptV3(stream, accept); err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		session.removeChannel(ch.id, ch)
 		_ = wsConn.Close()
-		log.Printf("[服务端] v2 ChannelAccept 写入失败: %v", err)
+		log.Printf("[服务端] v3 ChannelAccept 写入失败: %v", err)
 		return
 	}
 	atomic.AddUint64(&serverProtocolOKSeq, 1)
-	log.Printf("[服务端] v2 客户端通道 %d 连接, 会话ID: %s, IP: %s caps=0x%x", ch.id, shortID(sessionID), clientIP, caps)
+	log.Printf("[服务端] v3 客户端通道 %d 连接, 会话ID: %s, IP: %s caps=0x%x cipher=%s", ch.id, shortID(sessionID), clientIP, caps, v3CipherName(chosenCipher))
 	_ = stream.SetDeadline(time.Time{})
 	_ = netConn.SetDeadline(time.Time{})
 	handleAuthenticatedSmuxSession(ch, sess)
@@ -791,23 +825,27 @@ func handleWebSocketChannel(ch *WSChannel) {
 
 func rejectSmuxStreamDueToLimit(ch *WSChannel, stream *smux.Stream) {
 	defer stream.Close()
+	cStream, err := wrapV3DataStream(ch, stream)
+	if err != nil {
+		return
+	}
 	timeout := cfg.RTTProbeTimeout
 	if timeout <= 0 || timeout > 200*time.Millisecond {
 		timeout = 200 * time.Millisecond
 	}
-	_ = stream.SetDeadline(time.Now().Add(timeout))
-	kind, _, _, err := readSmuxOpenHeader(stream)
-	_ = stream.SetDeadline(time.Time{})
+	_ = cStream.SetDeadline(time.Now().Add(timeout))
+	kind, _, _, err := readSmuxOpenHeader(cStream)
+	_ = cStream.SetDeadline(time.Time{})
 	if err != nil {
 		return
 	}
 	caps := atomic.LoadUint64(&ch.capabilities)
 	if kind == streamKindTCP {
-		_ = writeTCPOpenFailure(stream, caps, openStatusCodeResourceLimit, "max streams reached")
+		_ = writeTCPOpenFailure(cStream, caps, openStatusCodeResourceLimit, "max streams reached")
 		return
 	}
 	if kind == streamKindUDP {
-		_ = writeUDPOpenFailure(stream, caps, openStatusCodeResourceLimit, "max streams reached")
+		_ = writeUDPOpenFailure(cStream, caps, openStatusCodeResourceLimit, "max streams reached")
 	}
 }
 
@@ -898,13 +936,17 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 		session.releaseStream()
 		stream.Close()
 	}()
-	streamID := atomic.AddUint64(&serverStreamSeq, 1)
-	_ = stream.SetDeadline(time.Now().Add(cfg.RTTProbeTimeout))
-	kind, strategy, target, err := readSmuxOpenHeader(stream)
+	cStream, err := wrapV3DataStream(ch, stream)
 	if err != nil {
 		return
 	}
-	_ = stream.SetDeadline(time.Time{})
+	streamID := atomic.AddUint64(&serverStreamSeq, 1)
+	_ = cStream.SetDeadline(time.Now().Add(cfg.RTTProbeTimeout))
+	kind, strategy, target, err := readSmuxOpenHeader(cStream)
+	if err != nil {
+		return
+	}
+	_ = cStream.SetDeadline(time.Time{})
 	log.Printf("[服务端] stream=%d client=%s channel=%d kind=%d target=%s", streamID, shortID(session.clientID), ch.id, kind, target)
 	if !isSupportedStreamKind(kind) {
 		atomic.AddUint64(&serverUnsupportedStreamSeq, 1)
@@ -913,32 +955,32 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 	}
 	switch kind {
 	case streamKindPing:
-		_ = stream.SetDeadline(time.Now().Add(cfg.RTTProbeTimeout))
-		defer stream.SetDeadline(time.Time{})
+		_ = cStream.SetDeadline(time.Now().Add(cfg.RTTProbeTimeout))
+		defer cStream.SetDeadline(time.Time{})
 		payload := make([]byte, 8)
-		if _, err := io.ReadFull(stream, payload); err != nil {
+		if _, err := io.ReadFull(cStream, payload); err != nil {
 			return
 		}
-		_ = writeAll(stream, payload)
+		_ = writeAll(cStream, payload)
 	case streamKindTCP:
 		log.Printf("[服务端] 客户ID:%s TCP 打开: %s, 通道:%d", shortID(session.clientID), target, ch.id)
 		caps := atomic.LoadUint64(&ch.capabilities)
 		if err := validateIPStrategyValue(strategy); err != nil {
 			atomic.AddUint64(&serverTargetRejectSeq, 1)
 			log.Printf("[服务端] 客户ID:%s TCP 拒绝: %s, reason=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
-			_ = writeTCPOpenFailure(stream, caps, openStatusCodeBadTarget, err.Error())
+			_ = writeTCPOpenFailure(cStream, caps, openStatusCodeBadTarget, err.Error())
 			return
 		}
 		if err := validateSmuxStreamTarget(target); err != nil {
 			atomic.AddUint64(&serverTargetRejectSeq, 1)
 			log.Printf("[服务端] 客户ID:%s TCP 拒绝: %s, reason=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
-			_ = writeTCPOpenFailure(stream, caps, openStatusCodeBadTarget, err.Error())
+			_ = writeTCPOpenFailure(cStream, caps, openStatusCodeBadTarget, err.Error())
 			return
 		}
 		if err := ensureTargetAllowed(target); err != nil {
 			atomic.AddUint64(&serverTargetRejectSeq, 1)
 			log.Printf("[服务端] 客户ID:%s TCP 拒绝: %s, reason=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
-			_ = writeTCPOpenFailure(stream, caps, openStatusCodePolicyDenied, err.Error())
+			_ = writeTCPOpenFailure(cStream, caps, openStatusCodePolicyDenied, err.Error())
 			return
 		}
 		var tcpConn net.Conn
@@ -949,14 +991,14 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 		}
 		if err != nil {
 			log.Printf("[服务端] 客户ID:%s TCP 连接失败: %s, err=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
-			_ = writeTCPOpenFailure(stream, caps, openStatusCodeDialFailed, err.Error())
+			_ = writeTCPOpenFailure(cStream, caps, openStatusCodeDialFailed, err.Error())
 			return
 		}
-		if err := writeTCPOpenSuccess(stream, caps); err != nil {
+		if err := writeTCPOpenSuccess(cStream, caps); err != nil {
 			_ = tcpConn.Close()
 			return
 		}
-		proxyConnStream(tcpConn, stream)
+		proxyConnStream(tcpConn, cStream)
 		log.Printf("[服务端] 客户ID:%s TCP 关闭: %s, 通道:%d", shortID(session.clientID), target, ch.id)
 	case streamKindUDP:
 		log.Printf("[服务端] 客户ID:%s SOCKS5 UDP 访问: %s, 通道:%d", shortID(session.clientID), target, ch.id)
@@ -964,19 +1006,19 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 		if err := validateIPStrategyValue(strategy); err != nil {
 			atomic.AddUint64(&serverTargetRejectSeq, 1)
 			log.Printf("[服务端] 客户ID:%s UDP 拒绝: %s, reason=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
-			_ = writeUDPOpenFailure(stream, caps, openStatusCodeBadTarget, err.Error())
+			_ = writeUDPOpenFailure(cStream, caps, openStatusCodeBadTarget, err.Error())
 			return
 		}
 		if err := validateSmuxStreamTarget(target); err != nil {
 			atomic.AddUint64(&serverTargetRejectSeq, 1)
 			log.Printf("[服务端] 客户ID:%s UDP 拒绝: %s, reason=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
-			_ = writeUDPOpenFailure(stream, caps, openStatusCodeBadTarget, err.Error())
+			_ = writeUDPOpenFailure(cStream, caps, openStatusCodeBadTarget, err.Error())
 			return
 		}
 		if err := ensureTargetAllowed(target); err != nil {
 			atomic.AddUint64(&serverTargetRejectSeq, 1)
 			log.Printf("[服务端] 客户ID:%s UDP 拒绝: %s, reason=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
-			_ = writeUDPOpenFailure(stream, caps, openStatusCodePolicyDenied, err.Error())
+			_ = writeUDPOpenFailure(cStream, caps, openStatusCodePolicyDenied, err.Error())
 			return
 		}
 		var relay UDPRelayer
@@ -985,7 +1027,7 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 			socksRelay, err = newSOCKS5UDPRelay(target)
 			if err != nil {
 				log.Printf("[服务端] 客户ID:%s SOCKS5 UDP中继创建失败: %v, 通道:%d", shortID(session.clientID), err, ch.id)
-				_ = writeUDPOpenFailure(stream, caps, openStatusCodeDialFailed, err.Error())
+				_ = writeUDPOpenFailure(cStream, caps, openStatusCodeDialFailed, err.Error())
 				return
 			}
 			relay = socksRelay
@@ -993,22 +1035,19 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 			addr, errResolve := resolveUDPWithStrategy(target, strategy)
 			if errResolve != nil {
 				log.Printf("[服务端] 客户ID:%s UDP 解析失败: %s, err=%v, 通道:%d", shortID(session.clientID), target, errResolve, ch.id)
-				_ = writeUDPOpenFailure(stream, caps, openStatusCodeDialFailed, errResolve.Error())
+				_ = writeUDPOpenFailure(cStream, caps, openStatusCodeDialFailed, errResolve.Error())
 				return
 			}
 			udpConn, errListen := net.ListenUDP("udp", nil)
 			if errListen != nil {
 				log.Printf("[服务端] 客户ID:%s UDP 监听失败: %s, err=%v, 通道:%d", shortID(session.clientID), target, errListen, ch.id)
-				_ = writeUDPOpenFailure(stream, caps, openStatusCodeDialFailed, errListen.Error())
+				_ = writeUDPOpenFailure(cStream, caps, openStatusCodeDialFailed, errListen.Error())
 				return
 			}
 			relay = &DirectUDPRelayer{conn: udpConn, target: addr}
 		}
-		if relay == nil {
-			return
-		}
 		defer relay.Close()
-		if err := writeUDPOpenSuccess(stream, caps); err != nil {
+		if err := writeUDPOpenSuccess(cStream, caps); err != nil {
 			return
 		}
 		done := make(chan struct{})
@@ -1016,7 +1055,7 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 			defer close(done)
 			defer relay.Close()
 			for {
-				packet, e := readChunk(stream)
+				packet, e := readChunk(cStream)
 				if e != nil {
 					return
 				}
@@ -1052,7 +1091,7 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 				log.Printf("[服务端] 客户ID:%s UDP 读取失败: %s, err=%v, 通道:%d", shortID(session.clientID), target, e, ch.id)
 				return
 			}
-			if err := writeUDPReply(stream, addr, buf[:n]); err != nil {
+			if err := writeUDPReply(cStream, addr, buf[:n]); err != nil {
 				log.Printf("[服务端] 客户ID:%s UDP 响应写入失败: %s, err=%v, 通道:%d", shortID(session.clientID), target, err, ch.id)
 				return
 			}

@@ -39,11 +39,19 @@ const (
 	v2RejectReplayDetected       = wire.V2RejectReplayDetected
 	v2RejectResourceLimit        = wire.V2RejectResourceLimit
 	v2RejectMalformedFrame       = wire.V2RejectMalformedFrame
+
+	protocolV3Version              = wire.ProtocolV3Version
+	protocolCipherChaCha20Poly1305 = wire.ProtocolCipherChaCha20Poly1305
+	protocolCipherAES256GCM        = wire.ProtocolCipherAES256GCM
+	protocolCipherAES128GCM        = wire.ProtocolCipherAES128GCM
+	v3RejectUnsupportedCipher      = wire.V3RejectUnsupportedCipher
 )
 
 type ChannelInit = wire.ChannelInit
 type ChannelAccept = wire.ChannelAccept
 type ChannelReject = wire.ChannelReject
+type V3SessionKeys = wire.V3SessionKeys
+type V3CipherStream = wire.V3CipherStream
 
 func isSupportedStreamKind(kind byte) bool { return wire.IsSupportedStreamKind(kind) }
 
@@ -71,6 +79,62 @@ func readChannelAcceptOrReject(r io.Reader, maxSize int) (ChannelAccept, Channel
 
 func writeChannelReject(w io.Writer, reject ChannelReject) error {
 	return wire.WriteChannelReject(w, reject)
+}
+
+func writeChannelInitV3(w io.Writer, init ChannelInit) error {
+	return wire.WriteChannelInitV3(w, init)
+}
+
+func readChannelInitV3(r io.Reader, maxSize int) (ChannelInit, error) {
+	return wire.ReadChannelInitV3(r, maxSize)
+}
+
+func writeChannelAcceptV3(w io.Writer, accept ChannelAccept) error {
+	return wire.WriteChannelAcceptV3(w, accept)
+}
+
+func readChannelAcceptOrRejectV3(r io.Reader, maxSize int) (ChannelAccept, ChannelReject, error) {
+	return wire.ReadChannelAcceptOrRejectV3(r, maxSize)
+}
+
+func writeChannelRejectV3(w io.Writer, reject ChannelReject) error {
+	return wire.WriteChannelRejectV3(w, reject)
+}
+
+func negotiateCipherV3(pref []byte) (chosen byte, rejectCode byte, msg string) {
+	return wire.NegotiateCipherV3(pref)
+}
+
+func v3SupportedCiphers() []byte {
+	return wire.V3SupportedCiphers()
+}
+
+func v3CipherKeyLen(id byte) int {
+	return wire.V3CipherKeyLen(id)
+}
+
+func v3CipherName(id byte) string {
+	return wire.V3CipherName(id)
+}
+
+func computeV3TranscriptHash(serverName, path string, init ChannelInit) ([]byte, error) {
+	return wire.ComputeV3TranscriptHash(serverName, path, init)
+}
+
+func computeV3AuthProof(token, serverName, path string, init ChannelInit) ([]byte, error) {
+	return wire.ComputeV3AuthProof(token, serverName, path, init)
+}
+
+func verifyV3AuthProof(token, serverName, path string, init ChannelInit) bool {
+	return wire.VerifyV3AuthProof(token, serverName, path, init)
+}
+
+func deriveV3SessionKeys(token string, transcriptHash []byte) (V3SessionKeys, error) {
+	return wire.DeriveV3SessionKeys(token, transcriptHash)
+}
+
+func newV3CipherStream(inner io.ReadWriteCloser, keys V3SessionKeys, cipherID byte, streamID uint32, clientSide bool) (*V3CipherStream, error) {
+	return wire.NewV3CipherStream(inner, keys, cipherID, streamID, clientSide)
 }
 
 func computeV2AuthProof(token, serverName, path string, init ChannelInit) ([]byte, error) {

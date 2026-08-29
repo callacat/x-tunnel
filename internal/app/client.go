@@ -21,17 +21,36 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// defaultCipherPreference defines the default client cipher suite preference list.
+// Future versions may allow runtime or config override.
+var defaultCipherPreference = []byte{
+	protocolCipherChaCha20Poly1305,
+	protocolCipherAES256GCM,
+	protocolCipherAES128GCM,
+}
+
 type ECHPool struct {
 	wsServerAddr  string
 	connectionNum int
 	targetIPs     []string
 	clientID      string
 
-	wsConnsMu     sync.RWMutex
-	smuxConns     []*smux.Session
-	channelRTT    []int64
-	channelCaps   []uint64
-	selectCounter uint64
+	wsConnsMu      sync.RWMutex
+	smuxConns      []*smux.Session
+	channelRTT     []int64
+	channelCaps    []uint64
+	channelKeys    []V3SessionKeys
+	channelCiphers []byte
+	selectCounter  uint64
+}
+
+func (p *ECHPool) channelV3Security(idx int) (V3SessionKeys, byte, bool) {
+	p.wsConnsMu.RLock()
+	defer p.wsConnsMu.RUnlock()
+	if idx < 0 || idx >= len(p.channelKeys) {
+		return V3SessionKeys{}, 0, false
+	}
+	return p.channelKeys[idx], p.channelCiphers[idx], true
 }
 
 func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
@@ -40,13 +59,15 @@ func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 		total = len(ips) * n
 	}
 	p := &ECHPool{
-		wsServerAddr:  addr,
-		connectionNum: n,
-		targetIPs:     ips,
-		clientID:      clientID,
-		smuxConns:     make([]*smux.Session, total),
-		channelRTT:    make([]int64, total),
-		channelCaps:   make([]uint64, total),
+		wsServerAddr:   addr,
+		connectionNum:  n,
+		targetIPs:      ips,
+		clientID:       clientID,
+		smuxConns:      make([]*smux.Session, total),
+		channelRTT:     make([]int64, total),
+		channelCaps:    make([]uint64, total),
+		channelKeys:    make([]V3SessionKeys, total),
+		channelCiphers: make([]byte, total),
 	}
 	return p
 }
@@ -97,7 +118,7 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 			}
 			continue
 		}
-		caps, err := negotiateClientProtocol(sess, cfg.RTTProbeTimeout, p.clientID, uint32(chID), p.wsServerAddr)
+		caps, keys, cipher, err := negotiateClientProtocol(sess, cfg.RTTProbeTimeout, p.clientID, uint32(chID), p.wsServerAddr)
 		if err != nil {
 			atomic.AddUint64(&clientProtocolFailureSeq, 1)
 			_ = sess.Close()
@@ -108,15 +129,17 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 			continue
 		}
 		atomic.AddUint64(&clientProtocolOKSeq, 1)
-		log.Printf("[客户端] 通道 %d (IP:%s) v2 协议协商成功: version=2 caps=0x%x", chID, ipLabel, caps)
+		log.Printf("[客户端] 通道 %d (IP:%s) v3 协议协商成功: version=3 caps=0x%x cipher=%s", chID, ipLabel, caps, v3CipherName(cipher))
 		p.wsConnsMu.Lock()
 		p.smuxConns[idx] = sess
 		p.channelRTT[idx] = 0
 		p.channelCaps[idx] = caps
+		p.channelKeys[idx] = keys
+		p.channelCiphers[idx] = cipher
 		p.wsConnsMu.Unlock()
 		log.Printf("[客户端] 通道 %d (IP:%s) 就绪 (smux)", chID, ipLabel)
 		reconnectAttempt = 0
-		if rtt, err := p.probeChannelRTTOnce(sess, cfg.RTTProbeTimeout); err == nil {
+		if rtt, err := p.probeChannelRTTOnce(sess, idx, cfg.RTTProbeTimeout); err == nil {
 			atomic.StoreInt64(&p.channelRTT[idx], rtt)
 		} else {
 			atomic.AddUint64(&clientRTTProbeFailureSeq, 1)
@@ -147,6 +170,8 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		p.smuxConns[idx] = nil
 		p.channelRTT[idx] = 0
 		p.channelCaps[idx] = 0
+		p.channelKeys[idx] = V3SessionKeys{}
+		p.channelCiphers[idx] = 0
 		p.wsConnsMu.Unlock()
 		if probeErr != nil {
 			log.Printf("[客户端] 通道 %d 断开原因: %v", chID, probeErr)
@@ -169,7 +194,7 @@ func (p *ECHPool) probeChannelRTT(sess *smux.Session, idx int, done chan error) 
 	ticker := time.NewTicker(cfg.RTTProbeTimeout)
 	defer ticker.Stop()
 	for {
-		rtt, err := p.probeChannelRTTOnce(sess, cfg.RTTProbeTimeout)
+		rtt, err := p.probeChannelRTTOnce(sess, idx, cfg.RTTProbeTimeout)
 		if err != nil {
 			atomic.AddUint64(&clientRTTProbeFailureSeq, 1)
 			atomic.StoreInt64(&p.channelRTT[idx], int64(cfg.RTTProbeTimeout.Nanoseconds()))
@@ -185,24 +210,32 @@ func (p *ECHPool) probeChannelRTT(sess *smux.Session, idx int, done chan error) 
 	}
 }
 
-func (p *ECHPool) probeChannelRTTOnce(sess *smux.Session, timeout time.Duration) (int64, error) {
+func (p *ECHPool) probeChannelRTTOnce(sess *smux.Session, idx int, timeout time.Duration) (int64, error) {
+	keys, cipher, ok := p.channelV3Security(idx)
+	if !ok {
+		return 0, fmt.Errorf("通道安全配置不可用")
+	}
 	start := time.Now()
 	s, err := sess.OpenStream()
 	if err != nil {
 		return 0, err
 	}
 	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(timeout))
-	if err := writeSmuxOpenHeader(s, streamKindPing, 0, ""); err != nil {
+	cs, err := newV3CipherStream(s, keys, cipher, s.ID(), true)
+	if err != nil {
+		return 0, err
+	}
+	_ = cs.SetDeadline(time.Now().Add(timeout))
+	if err := writeSmuxOpenHeader(cs, streamKindPing, 0, ""); err != nil {
 		return 0, err
 	}
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint64(payload, uint64(start.UnixNano()))
-	if err := writeAll(s, payload); err != nil {
+	if err := writeAll(cs, payload); err != nil {
 		return 0, err
 	}
 	ack := make([]byte, 8)
-	if _, err := io.ReadFull(s, ack); err != nil {
+	if _, err := io.ReadFull(cs, ack); err != nil {
 		return 0, err
 	}
 	if !bytes.Equal(ack, payload) {
@@ -215,24 +248,24 @@ func (p *ECHPool) probeChannelRTTOnce(sess *smux.Session, timeout time.Duration)
 	return rtt, nil
 }
 
-func negotiateClientProtocol(sess *smux.Session, timeout time.Duration, clientID string, channelID uint32, serverAddr string) (uint64, error) {
+func negotiateClientProtocol(sess *smux.Session, timeout time.Duration, clientID string, channelID uint32, serverAddr string) (uint64, V3SessionKeys, byte, error) {
 	s, err := sess.OpenStream()
 	if err != nil {
-		return 0, err
+		return 0, V3SessionKeys{}, 0, err
 	}
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(timeout))
 	sessionID, err := clientSessionIDBytes(clientID)
 	if err != nil {
-		return 0, err
+		return 0, V3SessionKeys{}, 0, err
 	}
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
-		return 0, err
+		return 0, V3SessionKeys{}, 0, err
 	}
 	serverName, serverPath, err := protocolAuthEndpoint(serverAddr)
 	if err != nil {
-		return 0, err
+		return 0, V3SessionKeys{}, 0, err
 	}
 	init := ChannelInit{
 		SessionID:    sessionID,
@@ -240,36 +273,45 @@ func negotiateClientProtocol(sess *smux.Session, timeout time.Duration, clientID
 		ClientNonce:  nonce,
 		Timestamp:    time.Now().Unix(),
 		Capabilities: currentProtocolCapabilitiesV2(),
+		CipherPref:   defaultCipherPreference,
 	}
-	proof, err := computeV2AuthProof(token, serverName, serverPath, init)
+	proof, err := computeV3AuthProof(token, serverName, serverPath, init)
 	if err != nil {
-		return 0, err
+		return 0, V3SessionKeys{}, 0, err
 	}
 	init.AuthProof = proof
-	if err := writeChannelInit(s, init); err != nil {
-		return 0, err
+	if err := writeChannelInitV3(s, init); err != nil {
+		return 0, V3SessionKeys{}, 0, err
 	}
-	accept, reject, err := readChannelAcceptOrReject(s, maxV2FrameSize)
+	accept, reject, err := readChannelAcceptOrRejectV3(s, maxV2FrameSize)
 	if err != nil {
-		return 0, err
+		return 0, V3SessionKeys{}, 0, err
 	}
 	if reject.Code != 0 {
 		if reject.Code == v2RejectAuthenticationFailed {
 			if reject.Message != "" {
-				return 0, fmt.Errorf("认证失败: %s", reject.Message)
+				return 0, V3SessionKeys{}, 0, fmt.Errorf("认证失败: %s", reject.Message)
 			}
-			return 0, fmt.Errorf("认证失败")
+			return 0, V3SessionKeys{}, 0, fmt.Errorf("认证失败")
 		}
 		if reject.Message != "" {
-			return 0, fmt.Errorf("协议协商失败: reject=%d %s", reject.Code, reject.Message)
+			return 0, V3SessionKeys{}, 0, fmt.Errorf("协议协商失败: reject=%d %s", reject.Code, reject.Message)
 		}
-		return 0, fmt.Errorf("协议协商失败: reject=%d", reject.Code)
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("协议协商失败: reject=%d", reject.Code)
 	}
 	required := requiredProtocolCapabilitiesV2()
 	if accept.Capabilities&required != required {
-		return 0, fmt.Errorf("协议能力不足: caps=0x%x", accept.Capabilities)
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("协议能力不足: caps=0x%x", accept.Capabilities)
 	}
-	return accept.Capabilities, nil
+	th, err := computeV3TranscriptHash(serverName, serverPath, init)
+	if err != nil {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("计算 transcript hash 失败: %w", err)
+	}
+	keys, err := deriveV3SessionKeys(token, th)
+	if err != nil {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("派生会话密钥失败: %w", err)
+	}
+	return accept.Capabilities, keys, accept.Cipher, nil
 }
 
 func shortID(id string) string {
@@ -314,7 +356,7 @@ func webSocketRequestHeader() http.Header {
 	return header
 }
 
-func proxyConnStream(c net.Conn, stream *smux.Stream) {
+func proxyConnStream(c net.Conn, stream io.ReadWriteCloser) {
 	done := make(chan struct{}, 2)
 	go func() {
 		n, _ := io.Copy(stream, c)
@@ -354,7 +396,7 @@ func logClientConnEvent(c net.Conn, reqType, target string, chID int, opened boo
 	log.Printf("[客户端] %s %s %s %s 通道 %d", clientSourceAddr(c), reqType, arrow, target, chID)
 }
 
-func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, error) {
+func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, V3SessionKeys, byte, error) {
 	p.wsConnsMu.RLock()
 	type candidate struct {
 		idx int
@@ -373,7 +415,7 @@ func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, error) {
 	}
 	p.wsConnsMu.RUnlock()
 	if len(cands) == 0 {
-		return nil, 0, 0, 0, fmt.Errorf("无可用 smux 通道")
+		return nil, 0, 0, 0, V3SessionKeys{}, 0, fmt.Errorf("无可用 smux 通道")
 	}
 	minRTT := cands[0].rtt
 	for _, c := range cands[1:] {
@@ -384,7 +426,7 @@ func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, error) {
 	tieWindow := int64((10 * time.Millisecond).Nanoseconds())
 	near := make([]candidate, 0, len(cands))
 	for _, c := range cands {
-		if c.rtt <= minRTT+tieWindow {
+		if c.rtt-minRTT <= tieWindow {
 			near = append(near, c)
 		}
 	}
@@ -392,77 +434,98 @@ func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, error) {
 	best := near[pick]
 	p.wsConnsMu.RLock()
 	sess := p.smuxConns[best.idx]
-	caps := p.channelCaps[best.idx]
+	var caps uint64
+	if best.idx < len(p.channelCaps) {
+		caps = p.channelCaps[best.idx]
+	}
+	var keys V3SessionKeys
+	if best.idx < len(p.channelKeys) {
+		keys = p.channelKeys[best.idx]
+	}
+	var cipher byte
+	if best.idx < len(p.channelCiphers) {
+		cipher = p.channelCiphers[best.idx]
+	}
 	p.wsConnsMu.RUnlock()
 	if sess == nil || sess.IsClosed() {
-		return nil, 0, 0, 0, fmt.Errorf("通道不可用")
+		return nil, 0, 0, 0, V3SessionKeys{}, 0, fmt.Errorf("通道不可用")
 	}
 	decision := best.idx + 1
 	s, err := sess.OpenStream()
 	if err != nil {
-		return nil, 0, 0, 0, err
+		return nil, 0, 0, 0, V3SessionKeys{}, 0, err
 	}
-	return s, best.idx + 1, decision, caps, nil
+	return s, best.idx + 1, decision, caps, keys, cipher, nil
 }
 
-func (p *ECHPool) openTCPStream(target string) (*smux.Stream, int, int, error) {
-	s, chID, decision, caps, err := p.openBestStream()
+func (p *ECHPool) openTCPStream(target string) (*V3CipherStream, int, int, error) {
+	s, chID, decision, caps, keys, cipher, err := p.openBestStream()
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindTCP, ipStrategy, target); err != nil {
+	cs, err := newV3CipherStream(s, keys, cipher, s.ID(), true)
+	if err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
-	_ = s.SetDeadline(time.Now().Add(cfg.DialTimeout))
+	if err := writeSmuxOpenHeader(cs, streamKindTCP, ipStrategy, target); err != nil {
+		_ = cs.Close()
+		return nil, 0, 0, err
+	}
+	_ = cs.SetDeadline(time.Now().Add(cfg.DialTimeout))
 	var status byte
 	var code byte
 	var message string
 	if caps&protocolCapabilityOpenStatusCode != 0 {
-		status, code, message, err = readTCPOpenStatusCode(s)
+		status, code, message, err = readTCPOpenStatusCode(cs)
 	} else {
-		status, message, err = readTCPOpenStatus(s)
+		status, message, err = readTCPOpenStatus(cs)
 	}
-	_ = s.SetDeadline(time.Time{})
+	_ = cs.SetDeadline(time.Time{})
 	if err != nil {
-		_ = s.Close()
+		_ = cs.Close()
 		return nil, 0, 0, err
 	}
 	if status != tcpOpenStatusOK {
-		_ = s.Close()
+		_ = cs.Close()
 		return nil, 0, 0, &remoteOpenError{network: "TCP", status: status, code: code, message: message}
 	}
-	return s, chID, decision, nil
+	return cs, chID, decision, nil
 }
 
-func (p *ECHPool) openUDPStream(target string) (*smux.Stream, int, int, error) {
-	s, chID, decision, caps, err := p.openBestStream()
+func (p *ECHPool) openUDPStream(target string) (*V3CipherStream, int, int, error) {
+	s, chID, decision, caps, keys, cipher, err := p.openBestStream()
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindUDP, ipStrategy, target); err != nil {
+	cs, err := newV3CipherStream(s, keys, cipher, s.ID(), true)
+	if err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
-	_ = s.SetDeadline(time.Now().Add(cfg.DialTimeout))
+	if err := writeSmuxOpenHeader(cs, streamKindUDP, ipStrategy, target); err != nil {
+		_ = cs.Close()
+		return nil, 0, 0, err
+	}
+	_ = cs.SetDeadline(time.Now().Add(cfg.DialTimeout))
 	var status byte
 	var code byte
 	var message string
 	if caps&protocolCapabilityOpenStatusCode != 0 {
-		status, code, message, err = readUDPOpenStatusCode(s)
+		status, code, message, err = readUDPOpenStatusCode(cs)
 	} else {
-		status, message, err = readUDPOpenStatus(s)
+		status, message, err = readUDPOpenStatus(cs)
 	}
-	_ = s.SetDeadline(time.Time{})
+	_ = cs.SetDeadline(time.Time{})
 	if err != nil {
-		_ = s.Close()
+		_ = cs.Close()
 		return nil, 0, 0, err
 	}
 	if status != udpOpenStatusOK {
-		_ = s.Close()
+		_ = cs.Close()
 		return nil, 0, 0, &remoteOpenError{network: "UDP", status: status, code: code, message: message}
 	}
-	return s, chID, decision, nil
+	return cs, chID, decision, nil
 }
 
 // ======================== TCP Forwarder ========================

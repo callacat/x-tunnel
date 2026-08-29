@@ -85,6 +85,7 @@ type ChannelInit struct {
 	Timestamp    int64
 	Capabilities uint64
 	AuthProof    []byte
+	CipherPref   []byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
 }
 
 type ChannelAccept struct {
@@ -94,6 +95,7 @@ type ChannelAccept struct {
 	MaxFrameSize uint32
 	MaxStreams   uint32
 	Message      string
+	Cipher       byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
 }
 
 type ChannelReject struct {

@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -2190,7 +2191,7 @@ func TestHandleWebSocketChannelReturnsTCPStatusWhenStreamLimitReached(t *testing
 		channels:      make(map[uint64]*WSChannel),
 		activeStreams: 1,
 	}
-	ch := &WSChannel{id: 1, conn: serverConn.ws, session: session}
+	ch := &WSChannel{id: 1, conn: serverConn.ws, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	atomic.StoreUint64(&ch.capabilities, protocolCapabilityTCPStatus)
 
 	done := make(chan struct{})
@@ -2208,12 +2209,17 @@ func TestHandleWebSocketChannelReturnsTCPStatusWhenStreamLimitReached(t *testing
 		_ = clientSession.Close()
 		t.Fatalf("open smux stream: %v", err)
 	}
-	_ = stream.SetDeadline(time.Now().Add(time.Second))
-	if err := writeSmuxOpenHeader(stream, streamKindTCP, IPStrategyDefault, "127.0.0.1:80"); err != nil {
+	cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), true)
+	if err != nil {
+		_ = clientSession.Close()
+		t.Fatalf("new cipher stream: %v", err)
+	}
+	_ = cs.SetDeadline(time.Now().Add(time.Second))
+	if err := writeSmuxOpenHeader(cs, streamKindTCP, IPStrategyDefault, "127.0.0.1:80"); err != nil {
 		_ = clientSession.Close()
 		t.Fatalf("write TCP open header: %v", err)
 	}
-	status, msg, err := readTCPOpenStatus(stream)
+	status, msg, err := readTCPOpenStatus(cs)
 	if err != nil {
 		_ = clientSession.Close()
 		t.Fatalf("read TCP open status: %v", err)
@@ -2249,7 +2255,7 @@ func TestHandleWebSocketChannelReturnsUDPStatusWhenStreamLimitReached(t *testing
 		channels:      make(map[uint64]*WSChannel),
 		activeStreams: 1,
 	}
-	ch := &WSChannel{id: 1, conn: serverConn.ws, session: session}
+	ch := &WSChannel{id: 1, conn: serverConn.ws, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	atomic.StoreUint64(&ch.capabilities, protocolCapabilityUDPStatus)
 
 	done := make(chan struct{})
@@ -2267,12 +2273,17 @@ func TestHandleWebSocketChannelReturnsUDPStatusWhenStreamLimitReached(t *testing
 		_ = clientSession.Close()
 		t.Fatalf("open smux stream: %v", err)
 	}
-	_ = stream.SetDeadline(time.Now().Add(time.Second))
-	if err := writeSmuxOpenHeader(stream, streamKindUDP, IPStrategyDefault, "127.0.0.1:53"); err != nil {
+	cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), true)
+	if err != nil {
+		_ = clientSession.Close()
+		t.Fatalf("new cipher stream: %v", err)
+	}
+	_ = cs.SetDeadline(time.Now().Add(time.Second))
+	if err := writeSmuxOpenHeader(cs, streamKindUDP, IPStrategyDefault, "127.0.0.1:53"); err != nil {
 		_ = clientSession.Close()
 		t.Fatalf("write UDP open header: %v", err)
 	}
-	status, msg, err := readUDPOpenStatus(stream)
+	status, msg, err := readUDPOpenStatus(cs)
 	if err != nil {
 		_ = clientSession.Close()
 		t.Fatalf("read UDP open status: %v", err)
@@ -2308,7 +2319,7 @@ func TestHandleWebSocketChannelReturnsUDPStatusCodeWhenStreamLimitReached(t *tes
 		channels:      make(map[uint64]*WSChannel),
 		activeStreams: 1,
 	}
-	ch := &WSChannel{id: 1, conn: serverConn.ws, session: session}
+	ch := &WSChannel{id: 1, conn: serverConn.ws, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	atomic.StoreUint64(&ch.capabilities, protocolCapabilityUDPStatus|protocolCapabilityOpenStatusCode)
 
 	done := make(chan struct{})
@@ -2326,12 +2337,17 @@ func TestHandleWebSocketChannelReturnsUDPStatusCodeWhenStreamLimitReached(t *tes
 		_ = clientSession.Close()
 		t.Fatalf("open smux stream: %v", err)
 	}
-	_ = stream.SetDeadline(time.Now().Add(time.Second))
-	if err := writeSmuxOpenHeader(stream, streamKindUDP, IPStrategyDefault, "127.0.0.1:53"); err != nil {
+	cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), true)
+	if err != nil {
+		_ = clientSession.Close()
+		t.Fatalf("new cipher stream: %v", err)
+	}
+	_ = cs.SetDeadline(time.Now().Add(time.Second))
+	if err := writeSmuxOpenHeader(cs, streamKindUDP, IPStrategyDefault, "127.0.0.1:53"); err != nil {
 		_ = clientSession.Close()
 		t.Fatalf("write UDP open header: %v", err)
 	}
-	status, code, msg, err := readUDPOpenStatusCode(stream)
+	status, code, msg, err := readUDPOpenStatusCode(cs)
 	if err != nil {
 		_ = clientSession.Close()
 		t.Fatalf("read UDP open status code: %v", err)
@@ -2358,7 +2374,7 @@ func TestHandleSmuxStreamReturnsUDPStatusOnRejectedOpen(t *testing.T) {
 		channels:      make(map[uint64]*WSChannel),
 		activeStreams: 1,
 	}
-	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityUDPStatus}
+	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityUDPStatus, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -2375,18 +2391,22 @@ func TestHandleSmuxStreamReturnsUDPStatusOnRejectedOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open smux stream: %v", err)
 	}
-	_ = stream.SetDeadline(time.Now().Add(time.Second))
-	if err := writeSmuxOpenHeader(stream, streamKindUDP, 0xff, "127.0.0.1:53"); err != nil {
+	cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), true)
+	if err != nil {
+		t.Fatalf("new client cipher stream: %v", err)
+	}
+	_ = cs.SetDeadline(time.Now().Add(time.Second))
+	if err := writeSmuxOpenHeader(cs, streamKindUDP, 0xff, "127.0.0.1:53"); err != nil {
 		t.Fatalf("write UDP open header: %v", err)
 	}
-	status, message, err := readUDPOpenStatus(stream)
+	status, message, err := readUDPOpenStatus(cs)
 	if err != nil {
 		t.Fatalf("read UDP open status: %v", err)
 	}
 	if status != udpOpenStatusError || !strings.Contains(message, "IP 策略无效") {
 		t.Fatalf("UDP open status = %d %q, want IP strategy error", status, message)
 	}
-	_ = stream.Close()
+	_ = cs.Close()
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server UDP rejection handler: %v", err)
 	}
@@ -4112,9 +4132,11 @@ func TestHandleSOCKS5ConnectProxiesOverSmux(t *testing.T) {
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 
 	serverDone := make(chan error, 1)
@@ -4125,11 +4147,16 @@ func TestHandleSOCKS5ConnectProxiesOverSmux(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -4138,12 +4165,12 @@ func TestHandleSOCKS5ConnectProxiesOverSmux(t *testing.T) {
 			serverDone <- fmt.Errorf("SOCKS5 CONNECT header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		if err := writeTCPOpenStatus(stream, tcpOpenStatusOK, ""); err != nil {
+		if err := writeTCPOpenStatus(cs, tcpOpenStatusOK, ""); err != nil {
 			serverDone <- err
 			return
 		}
 		request := make([]byte, len("socks5-connect-request"))
-		if _, err := io.ReadFull(stream, request); err != nil {
+		if _, err := io.ReadFull(cs, request); err != nil {
 			serverDone <- err
 			return
 		}
@@ -4151,7 +4178,7 @@ func TestHandleSOCKS5ConnectProxiesOverSmux(t *testing.T) {
 			serverDone <- fmt.Errorf("SOCKS5 CONNECT payload = %q", request)
 			return
 		}
-		serverDone <- writeAll(stream, []byte("socks5-connect-response"))
+		serverDone <- writeAll(cs, []byte("socks5-connect-response"))
 	}()
 
 	proxyServer, proxyClient := net.Pipe()
@@ -4206,9 +4233,11 @@ func TestHandleSOCKS5ConnectReturnsFailureOnTCPStatusError(t *testing.T) {
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 
 	serverDone := make(chan error, 1)
@@ -4219,11 +4248,16 @@ func TestHandleSOCKS5ConnectReturnsFailureOnTCPStatusError(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -4232,7 +4266,7 @@ func TestHandleSOCKS5ConnectReturnsFailureOnTCPStatusError(t *testing.T) {
 			serverDone <- fmt.Errorf("SOCKS5 CONNECT error header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenStatus(stream, tcpOpenStatusError, "blocked by policy")
+		serverDone <- writeTCPOpenStatus(cs, tcpOpenStatusError, "blocked by policy")
 	}()
 
 	proxyServer, proxyClient := net.Pipe()
@@ -4279,9 +4313,11 @@ func TestHandleSOCKS5ConnectMapsPolicyDeniedStatusCode(t *testing.T) {
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 
 	serverDone := make(chan error, 1)
@@ -4292,11 +4328,16 @@ func TestHandleSOCKS5ConnectMapsPolicyDeniedStatusCode(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -4305,7 +4346,7 @@ func TestHandleSOCKS5ConnectMapsPolicyDeniedStatusCode(t *testing.T) {
 			serverDone <- fmt.Errorf("SOCKS5 CONNECT status-code header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenStatusCode(stream, tcpOpenStatusError, openStatusCodePolicyDenied, "blocked by policy")
+		serverDone <- writeTCPOpenStatusCode(cs, tcpOpenStatusError, openStatusCodePolicyDenied, "blocked by policy")
 	}()
 
 	proxyServer, proxyClient := net.Pipe()
@@ -4746,9 +4787,11 @@ func TestHandleHTTPPostOpensStreamBeforeBodyComplete(t *testing.T) {
 		clientConn.Close()
 	})
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{1},
-		channelCaps: []uint64{currentProtocolCapabilitiesV2()},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{1},
+		channelCaps:    []uint64{currentProtocolCapabilitiesV2()},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 
 	accepted := make(chan *smux.Stream, 1)
@@ -4782,23 +4825,28 @@ func TestHandleHTTPPostOpensStreamBeforeBodyComplete(t *testing.T) {
 	case err := <-acceptErr:
 		t.Fatalf("accept smux stream: %v", err)
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for smux stream before POST body was complete")
+		t.Fatal("timed out waiting for HTTP proxy POST smux stream")
 	}
-	if err := serverStream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+	defer serverStream.Close()
+	csServer, err := newV3CipherStream(serverStream, testV3Keys, testV3Cipher, serverStream.ID(), false)
+	if err != nil {
+		t.Fatalf("new server cipher stream: %v", err)
+	}
+	if err := csServer.SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set server stream deadline: %v", err)
 	}
-	kind, strategy, target, err := readSmuxOpenHeader(serverStream)
+	kind, strategy, target, err := readSmuxOpenHeader(csServer)
 	if err != nil {
 		t.Fatalf("read POST smux header: %v", err)
 	}
 	if kind != streamKindTCP || strategy != IPStrategyDefault || target != "example.com:80" {
 		t.Fatalf("POST smux header = kind %d strategy %d target %q", kind, strategy, target)
 	}
-	if err := writeTCPOpenSuccess(serverStream, currentProtocolCapabilitiesV2()); err != nil {
+	if err := writeTCPOpenSuccess(csServer, currentProtocolCapabilitiesV2()); err != nil {
 		t.Fatalf("write POST TCP open status: %v", err)
 	}
 
-	br := bufio.NewReader(serverStream)
+	br := bufio.NewReader(csServer)
 	requestLine, err := br.ReadString('\n')
 	if err != nil {
 		t.Fatalf("read forwarded request line: %v", err)
@@ -4871,9 +4919,11 @@ func TestHandleHTTPConnectForwardsBufferedClientBytes(t *testing.T) {
 		clientConn.Close()
 	})
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{1},
-		channelCaps: []uint64{currentProtocolCapabilitiesV2()},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{1},
+		channelCaps:    []uint64{currentProtocolCapabilitiesV2()},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 
 	accepted := make(chan *smux.Stream, 1)
@@ -4899,7 +4949,7 @@ func TestHandleHTTPConnectForwardsBufferedClientBytes(t *testing.T) {
 	early := []byte("early-client-bytes")
 	req := append([]byte("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"), early...)
 	if err := writeAll(proxyClient, req); err != nil {
-		t.Fatalf("write CONNECT request with early bytes: %v", err)
+		t.Fatalf("write CONNECT request: %v", err)
 	}
 
 	var serverStream *smux.Stream
@@ -4910,17 +4960,22 @@ func TestHandleHTTPConnectForwardsBufferedClientBytes(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for CONNECT smux stream")
 	}
-	if err := serverStream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+	defer serverStream.Close()
+	csServer, err := newV3CipherStream(serverStream, testV3Keys, testV3Cipher, serverStream.ID(), false)
+	if err != nil {
+		t.Fatalf("new server cipher stream: %v", err)
+	}
+	if err := csServer.SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set server stream deadline: %v", err)
 	}
-	kind, strategy, target, err := readSmuxOpenHeader(serverStream)
+	kind, strategy, target, err := readSmuxOpenHeader(csServer)
 	if err != nil {
 		t.Fatalf("read CONNECT smux header: %v", err)
 	}
 	if kind != streamKindTCP || strategy != IPStrategyDefault || target != "example.com:443" {
 		t.Fatalf("CONNECT smux header = kind %d strategy %d target %q", kind, strategy, target)
 	}
-	if err := writeTCPOpenSuccess(serverStream, currentProtocolCapabilitiesV2()); err != nil {
+	if err := writeTCPOpenSuccess(csServer, currentProtocolCapabilitiesV2()); err != nil {
 		t.Fatalf("write CONNECT TCP open status: %v", err)
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(proxyClient), nil)
@@ -4941,7 +4996,7 @@ func TestHandleHTTPConnectForwardsBufferedClientBytes(t *testing.T) {
 		t.Fatalf("CONNECT response Transfer-Encoding = %q, want absent", got)
 	}
 	got := make([]byte, len(early))
-	if _, err := io.ReadFull(serverStream, got); err != nil {
+	if _, err := io.ReadFull(csServer, got); err != nil {
 		t.Fatalf("read buffered CONNECT bytes: %v", err)
 	}
 	if !bytes.Equal(got, early) {
@@ -4970,9 +5025,11 @@ func TestHandleHTTPConnectReturnsBadGatewayOnTCPStatusError(t *testing.T) {
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -4982,11 +5039,16 @@ func TestHandleHTTPConnectReturnsBadGatewayOnTCPStatusError(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -4995,7 +5057,7 @@ func TestHandleHTTPConnectReturnsBadGatewayOnTCPStatusError(t *testing.T) {
 			serverDone <- fmt.Errorf("HTTP CONNECT error header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenStatus(stream, tcpOpenStatusError, "blocked by policy")
+		serverDone <- writeTCPOpenStatus(cs, tcpOpenStatusError, "blocked by policy")
 	}()
 
 	proxyServer, proxyClient := net.Pipe()
@@ -5051,9 +5113,11 @@ func TestHandleHTTPConnectMapsPolicyDeniedStatusCodeToForbidden(t *testing.T) {
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -5063,11 +5127,16 @@ func TestHandleHTTPConnectMapsPolicyDeniedStatusCodeToForbidden(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -5076,7 +5145,7 @@ func TestHandleHTTPConnectMapsPolicyDeniedStatusCodeToForbidden(t *testing.T) {
 			serverDone <- fmt.Errorf("HTTP CONNECT status-code header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenStatusCode(stream, tcpOpenStatusError, openStatusCodePolicyDenied, "blocked by policy")
+		serverDone <- writeTCPOpenStatusCode(cs, tcpOpenStatusError, openStatusCodePolicyDenied, "blocked by policy")
 	}()
 
 	proxyServer, proxyClient := net.Pipe()
@@ -5125,9 +5194,11 @@ func TestHandleHTTPGetReturnsBadGatewayOnTCPStatusError(t *testing.T) {
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -5137,11 +5208,16 @@ func TestHandleHTTPGetReturnsBadGatewayOnTCPStatusError(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -5150,7 +5226,7 @@ func TestHandleHTTPGetReturnsBadGatewayOnTCPStatusError(t *testing.T) {
 			serverDone <- fmt.Errorf("HTTP GET error header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenStatus(stream, tcpOpenStatusError, "blocked by policy")
+		serverDone <- writeTCPOpenStatus(cs, tcpOpenStatusError, "blocked by policy")
 	}()
 
 	proxyServer, proxyClient := net.Pipe()
@@ -5272,60 +5348,23 @@ func TestIsSupportedStreamKind(t *testing.T) {
 	}
 }
 
+var (
+	testV3Keys, _ = deriveV3SessionKeys("test-token", make([]byte, 32))
+	testV3Cipher  = protocolCipherChaCha20Poly1305
+)
+
 func TestHandleSmuxStreamRejectsUnsupportedKind(t *testing.T) {
 	oldUnsupportedStreams := atomic.LoadUint64(&serverUnsupportedStreamSeq)
 	defer atomic.StoreUint64(&serverUnsupportedStreamSeq, oldUnsupportedStreams)
 	atomic.StoreUint64(&serverUnsupportedStreamSeq, 0)
 
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
-
-	serverSession, err := smux.Server(serverConn, nil)
-	if err != nil {
-		t.Fatalf("smux server: %v", err)
-	}
-	defer serverSession.Close()
-	clientSession, err := smux.Client(clientConn, nil)
-	if err != nil {
-		t.Fatalf("smux client: %v", err)
-	}
-	defer clientSession.Close()
-
-	accepted := make(chan *smux.Stream, 1)
-	acceptErr := make(chan error, 1)
-	go func() {
-		stream, err := serverSession.AcceptStream()
-		if err != nil {
-			acceptErr <- err
-			return
-		}
-		accepted <- stream
-	}()
-
-	clientStream, err := clientSession.OpenStream()
-	if err != nil {
-		t.Fatalf("open smux stream: %v", err)
-	}
-	defer clientStream.Close()
-	if err := writeSmuxOpenHeader(clientStream, 99, IPStrategyDefault, "unsupported.example:443"); err != nil {
-		t.Fatalf("write unsupported stream header: %v", err)
-	}
-
-	var serverStream *smux.Stream
-	select {
-	case serverStream = <-accepted:
-	case err := <-acceptErr:
-		t.Fatalf("accept smux stream: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for accepted smux stream")
-	}
-
+	clientStream, serverStream := openAcceptedSmuxTestStreamWithHeader(t, 99, IPStrategyDefault, "unsupported.example:443")
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "unsupported-kind-test", channels: make(map[uint64]*WSChannel)}
+	ch := &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
-		handleSmuxStream(session, &WSChannel{id: 1, session: session}, serverStream)
+		handleSmuxStream(session, ch, serverStream)
 	}()
 
 	select {
@@ -5336,23 +5375,28 @@ func TestHandleSmuxStreamRejectsUnsupportedKind(t *testing.T) {
 	if got := atomic.LoadUint64(&serverUnsupportedStreamSeq); got != 1 {
 		t.Fatalf("serverUnsupportedStreamSeq = %d, want 1", got)
 	}
+	_ = clientStream.Close()
 }
 
-func openAcceptedSmuxTestStream(t *testing.T, kind byte) (*smux.Stream, *smux.Stream) {
+func openAcceptedSmuxTestStream(t *testing.T, kind byte) (*V3CipherStream, *smux.Stream) {
 	return openAcceptedSmuxTestStreamWithHeader(t, kind, IPStrategyDefault, "")
 }
 
-func openAcceptedSmuxTestStreamWithHeader(t *testing.T, kind, strategy byte, target string) (*smux.Stream, *smux.Stream) {
+func openAcceptedSmuxTestStreamWithHeader(t *testing.T, kind, strategy byte, target string) (*V3CipherStream, *smux.Stream) {
 	t.Helper()
 
 	clientStream, serverStream := openRawAcceptedSmuxTestStream(t)
 	if err := clientStream.SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set client stream deadline: %v", err)
 	}
-	if err := writeSmuxOpenHeader(clientStream, kind, strategy, target); err != nil {
+	cs, err := newV3CipherStream(clientStream, testV3Keys, testV3Cipher, clientStream.ID(), true)
+	if err != nil {
+		t.Fatalf("new client cipher stream: %v", err)
+	}
+	if err := writeSmuxOpenHeader(cs, kind, strategy, target); err != nil {
 		t.Fatalf("write smux open header: %v", err)
 	}
-	return clientStream, serverStream
+	return cs, serverStream
 }
 
 func openRawAcceptedSmuxTestStream(t *testing.T) (*smux.Stream, *smux.Stream) {
@@ -5422,7 +5466,7 @@ func TestHandleSmuxStreamPingEcho(t *testing.T) {
 	session := &ClientSession{clientID: "ping-echo-test", channels: make(map[uint64]*WSChannel)}
 	go func() {
 		defer close(done)
-		handleSmuxStream(session, &WSChannel{id: 1, session: session}, serverStream)
+		handleSmuxStream(session, &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}, serverStream)
 	}()
 
 	ack := make([]byte, len(payload))
@@ -5452,7 +5496,7 @@ func TestHandleSmuxStreamPingDeadline(t *testing.T) {
 	session := &ClientSession{clientID: "ping-deadline-test", channels: make(map[uint64]*WSChannel)}
 	go func() {
 		defer close(done)
-		handleSmuxStream(session, &WSChannel{id: 1, session: session}, serverStream)
+		handleSmuxStream(session, &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}, serverStream)
 	}()
 
 	select {
@@ -5474,7 +5518,7 @@ func TestHandleSmuxStreamOpenHeaderDeadline(t *testing.T) {
 	session := &ClientSession{clientID: "open-header-deadline-test", channels: make(map[uint64]*WSChannel)}
 	go func() {
 		defer close(done)
-		handleSmuxStream(session, &WSChannel{id: 1, session: session}, serverStream)
+		handleSmuxStream(session, &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}, serverStream)
 	}()
 
 	select {
@@ -5495,16 +5539,21 @@ func TestHandleSmuxStreamTruncatedOpenHeaderTargetDeadline(t *testing.T) {
 	if err := clientStream.SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set client stream deadline: %v", err)
 	}
+	cs, err := newV3CipherStream(clientStream, testV3Keys, testV3Cipher, clientStream.ID(), true)
+	if err != nil {
+		t.Fatalf("new client cipher stream: %v", err)
+	}
 	raw := []byte{streamKindTCP, IPStrategyDefault, 0, 5, 'a'}
-	if err := writeAll(clientStream, raw); err != nil {
+	if err := writeAll(cs, raw); err != nil {
 		t.Fatalf("write truncated smux open header target: %v", err)
 	}
 
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "truncated-open-header-target-test", channels: make(map[uint64]*WSChannel)}
+	ch := &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
-		handleSmuxStream(session, &WSChannel{id: 1, session: session}, serverStream)
+		handleSmuxStream(session, ch, serverStream)
 	}()
 
 	select {
@@ -5550,8 +5599,12 @@ func TestHandleSmuxStreamRejectsMalformedTCPTargetWithStatus(t *testing.T) {
 		t.Fatalf("open smux stream: %v", err)
 	}
 	defer clientStream.Close()
-	_ = clientStream.SetDeadline(time.Now().Add(time.Second))
-	if err := writeSmuxOpenHeader(clientStream, streamKindTCP, IPStrategyDefault, ""); err != nil {
+	cs, err := newV3CipherStream(clientStream, testV3Keys, testV3Cipher, clientStream.ID(), true)
+	if err != nil {
+		t.Fatalf("new client cipher stream: %v", err)
+	}
+	_ = cs.SetDeadline(time.Now().Add(time.Second))
+	if err := writeSmuxOpenHeader(cs, streamKindTCP, IPStrategyDefault, ""); err != nil {
 		t.Fatalf("write malformed TCP stream header: %v", err)
 	}
 
@@ -5566,13 +5619,13 @@ func TestHandleSmuxStreamRejectsMalformedTCPTargetWithStatus(t *testing.T) {
 
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "malformed-target-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus}
+	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
 		handleSmuxStream(session, ch, serverStream)
 	}()
 
-	status, message, err := readTCPOpenStatus(clientStream)
+	status, message, err := readTCPOpenStatus(cs)
 	if err != nil {
 		t.Fatalf("read TCP open status: %v", err)
 	}
@@ -5598,7 +5651,7 @@ func TestHandleSmuxStreamRejectsInvalidIPStrategyWithStatus(t *testing.T) {
 	clientStream, serverStream := openAcceptedSmuxTestStreamWithHeader(t, streamKindTCP, 99, "127.0.0.1:80")
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "invalid-ip-strategy-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus}
+	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
 		handleSmuxStream(session, ch, serverStream)
@@ -5630,7 +5683,7 @@ func TestHandleSmuxStreamRejectsInvalidIPStrategyWithStatusCode(t *testing.T) {
 	clientStream, serverStream := openAcceptedSmuxTestStreamWithHeader(t, streamKindTCP, 99, "127.0.0.1:80")
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "invalid-ip-strategy-status-code-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode}
+	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
 		handleSmuxStream(session, ch, serverStream)
@@ -5671,7 +5724,7 @@ func TestHandleSmuxStreamRejectsPolicyWithStatusCode(t *testing.T) {
 	clientStream, serverStream := openAcceptedSmuxTestStreamWithHeader(t, streamKindTCP, IPStrategyDefault, "blocked.example.com:443")
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "policy-status-code-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode}
+	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
 		handleSmuxStream(session, ch, serverStream)
@@ -5712,7 +5765,7 @@ func TestHandleSmuxStreamTCPStatusSuccessProxiesBytes(t *testing.T) {
 	clientStream, serverStream := openAcceptedSmuxTestStreamWithHeader(t, streamKindTCP, IPStrategyDefault, targetAddr)
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "tcp-status-success-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus}
+	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityTCPStatus, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
 		handleSmuxStream(session, ch, serverStream)
@@ -5757,7 +5810,7 @@ func TestHandleSmuxStreamRejectsInvalidUDPIPStrategy(t *testing.T) {
 	session := &ClientSession{clientID: "invalid-udp-ip-strategy-test", channels: make(map[uint64]*WSChannel)}
 	go func() {
 		defer close(done)
-		handleSmuxStream(session, &WSChannel{id: 1, session: session}, serverStream)
+		handleSmuxStream(session, &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}, serverStream)
 	}()
 
 	select {
@@ -5788,7 +5841,7 @@ func TestHandleSmuxStreamUDPProxiesDatagram(t *testing.T) {
 	clientStream, serverStream := openAcceptedSmuxTestStreamWithHeader(t, streamKindUDP, IPStrategyDefault, targetAddr)
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "udp-smux-success-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session, capabilities: currentProtocolCapabilitiesV2()}
+	ch := &WSChannel{id: 1, session: session, capabilities: currentProtocolCapabilitiesV2(), v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
 		handleSmuxStream(session, ch, serverStream)
@@ -5841,7 +5894,7 @@ func TestHandleSmuxStreamUDPStatusOKBeforeDatagrams(t *testing.T) {
 	clientStream, serverStream := openAcceptedSmuxTestStreamWithHeader(t, streamKindUDP, IPStrategyDefault, targetAddr)
 	done := make(chan struct{})
 	session := &ClientSession{clientID: "udp-status-success-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityUDPStatus}
+	ch := &WSChannel{id: 1, session: session, capabilities: protocolCapabilityUDPStatus, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		defer close(done)
 		handleSmuxStream(session, ch, serverStream)
@@ -6086,7 +6139,7 @@ func TestProtocolAuthEndpointCanonicalizesServerName(t *testing.T) {
 func TestNegotiateClientProtocolSuccess(t *testing.T) {
 	oldToken := token
 	t.Cleanup(func() { token = oldToken })
-	token = "v2-test-token"
+	token = "v3-test-token"
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6100,65 +6153,89 @@ func TestNegotiateClientProtocolSuccess(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		init, err := readChannelInit(stream, maxV2FrameSize)
+		init, err := readChannelInitV3(stream, maxV2FrameSize)
 		if err != nil {
 			serverDone <- err
 			return
 		}
-		if !verifyV2AuthProof(token, "example.com", "/tunnel", init) {
+		if !verifyV3AuthProof(token, "example.com", "/tunnel", init) {
 			serverDone <- fmt.Errorf("auth proof did not verify")
 			return
 		}
-		serverDone <- writeChannelAccept(stream, ChannelAccept{
+		serverDone <- writeChannelAcceptV3(stream, ChannelAccept{
 			Capabilities: currentProtocolCapabilitiesV2(),
-			ServerNonce:  bytes.Repeat([]byte{1}, 32),
-			ServerTime:   time.Now().Unix(),
+			ServerNonce:  bytes.Repeat([]byte{0x22}, 32),
+			ServerTime:   init.Timestamp,
 			MaxFrameSize: maxV2FrameSize,
+			Cipher:       protocolCipherChaCha20Poly1305,
 		})
 	}()
 
-	caps, err := negotiateClientProtocol(clientSession, time.Second, uuid.NewString(), 1, "ws://example.com/tunnel")
+	caps, keys, cipher, err := negotiateClientProtocol(clientSession, time.Second, uuid.NewString(), 1, "ws://example.com/tunnel")
 	if err != nil {
 		t.Fatalf("negotiateClientProtocol returned error: %v", err)
 	}
 	if caps != currentProtocolCapabilitiesV2() {
 		t.Fatalf("negotiateClientProtocol caps = 0x%x, want 0x%x", caps, currentProtocolCapabilitiesV2())
 	}
+	if cipher != protocolCipherChaCha20Poly1305 {
+		t.Fatalf("negotiateClientProtocol cipher = %d, want %d", cipher, protocolCipherChaCha20Poly1305)
+	}
+	if len(keys.Seed) != 32 {
+		t.Fatalf("negotiateClientProtocol seed len = %d, want 32", len(keys.Seed))
+	}
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server ChannelInit handler returned error: %v", err)
 	}
 }
 
-func TestNegotiateClientProtocolRejectsBadResponses(t *testing.T) {
+func TestNegotiateClientProtocolErrors(t *testing.T) {
 	oldToken := token
 	t.Cleanup(func() { token = oldToken })
-	token = "v2-reject-token"
+	token = "v3-test-token"
+
 	tests := []struct {
 		name    string
 		reply   func(io.Writer) error
 		wantErr string
 	}{
 		{
-			name: "reject message",
+			name: "auth failed message",
 			reply: func(w io.Writer) error {
-				return writeChannelReject(w, ChannelReject{Code: v2RejectMalformedFrame, Message: "bad init"})
+				return writeChannelRejectV3(w, ChannelReject{Code: v2RejectAuthenticationFailed, Message: "token revoked"})
 			},
-			wantErr: "bad init",
+			wantErr: "认证失败: token revoked",
 		},
 		{
-			name: "auth reject",
+			name: "auth failed empty message",
 			reply: func(w io.Writer) error {
-				return writeChannelReject(w, ChannelReject{Code: v2RejectAuthenticationFailed, Message: "auth proof invalid"})
+				return writeChannelRejectV3(w, ChannelReject{Code: v2RejectAuthenticationFailed, Message: "auth proof invalid"})
 			},
 			wantErr: "认证失败",
 		},
 		{
-			name: "missing required capabilities accept",
+			name: "generic reject with message",
 			reply: func(w io.Writer) error {
-				return writeChannelAccept(w, ChannelAccept{
-					Capabilities: protocolCapabilityTCP,
-					ServerNonce:  bytes.Repeat([]byte{2}, 32),
+				return writeChannelRejectV3(w, ChannelReject{Code: v2RejectResourceLimit, Message: "too many clients"})
+			},
+			wantErr: "协议协商失败: reject=6 too many clients",
+		},
+		{
+			name: "generic reject without message",
+			reply: func(w io.Writer) error {
+				return writeChannelRejectV3(w, ChannelReject{Code: v2RejectTimestampSkew})
+			},
+			wantErr: "协议协商失败: reject=4",
+		},
+		{
+			name: "insufficient capabilities",
+			reply: func(w io.Writer) error {
+				return writeChannelAcceptV3(w, ChannelAccept{
+					Capabilities: 0,
+					ServerNonce:  bytes.Repeat([]byte{0x33}, 32),
 					ServerTime:   time.Now().Unix(),
+					MaxFrameSize: maxV2FrameSize,
+					Cipher:       protocolCipherChaCha20Poly1305,
 				})
 			},
 			wantErr: "协议能力不足",
@@ -6180,14 +6257,14 @@ func TestNegotiateClientProtocolRejectsBadResponses(t *testing.T) {
 					serverDone <- err
 					return
 				}
-				if _, err := readChannelInit(stream, maxV2FrameSize); err != nil {
+				if _, err := readChannelInitV3(stream, maxV2FrameSize); err != nil {
 					serverDone <- err
 					return
 				}
 				serverDone <- tt.reply(stream)
 			}()
 
-			caps, err := negotiateClientProtocol(clientSession, time.Second, uuid.NewString(), 1, "ws://example.com/tunnel")
+			caps, _, _, err := negotiateClientProtocol(clientSession, time.Second, uuid.NewString(), 1, "ws://example.com/tunnel")
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("negotiateClientProtocol err = %v, want containing %q", err, tt.wantErr)
 			}
@@ -6195,22 +6272,18 @@ func TestNegotiateClientProtocolRejectsBadResponses(t *testing.T) {
 				t.Fatalf("negotiateClientProtocol bad response = caps 0x%x, want 0", caps)
 			}
 			if err := <-serverDone; err != nil {
-				t.Fatalf("server bad v2 handler returned error: %v", err)
+				t.Fatalf("server bad handler returned error: %v", err)
 			}
 		})
 	}
 }
 
-func TestECHPoolProbeChannelRTTOnceUsesPingStream(t *testing.T) {
-	oldCfg := cfg
-	t.Cleanup(func() { cfg = oldCfg })
-	cfg.RTTProbeTimeout = time.Second
-
+func TestProbeChannelRTTOnce(t *testing.T) {
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	serverDone := make(chan struct{})
 	serverErr := make(chan error, 1)
 	session := &ClientSession{clientID: "probe-rtt-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session}
+	ch := &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	go func() {
 		stream, err := serverSession.AcceptStream()
 		if err != nil {
@@ -6221,8 +6294,11 @@ func TestECHPoolProbeChannelRTTOnceUsesPingStream(t *testing.T) {
 		close(serverDone)
 	}()
 
-	p := &ECHPool{}
-	rtt, err := p.probeChannelRTTOnce(clientSession, time.Second)
+	p := &ECHPool{
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
+	}
+	rtt, err := p.probeChannelRTTOnce(clientSession, 0, time.Second)
 	if err != nil {
 		t.Fatalf("probeChannelRTTOnce returned error: %v", err)
 	}
@@ -6239,19 +6315,19 @@ func TestECHPoolProbeChannelRTTOnceUsesPingStream(t *testing.T) {
 	}
 }
 
-func TestECHPoolProbeChannelRTTUpdatesAndExits(t *testing.T) {
-	oldCfg := cfg
+func TestProbeChannelRTTLoop(t *testing.T) {
 	oldFailures := atomic.LoadUint64(&clientRTTProbeFailureSeq)
-	t.Cleanup(func() {
-		cfg = oldCfg
+	oldCfg := cfg
+	defer func() {
 		atomic.StoreUint64(&clientRTTProbeFailureSeq, oldFailures)
-	})
-	cfg.RTTProbeTimeout = 20 * time.Millisecond
+		cfg = oldCfg
+	}()
 	atomic.StoreUint64(&clientRTTProbeFailureSeq, 0)
+	cfg.RTTProbeTimeout = 20 * time.Millisecond
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	session := &ClientSession{clientID: "probe-rtt-loop-test", channels: make(map[uint64]*WSChannel)}
-	ch := &WSChannel{id: 1, session: session}
+	ch := &WSChannel{id: 1, session: session, v3Keys: testV3Keys, v3Cipher: testV3Cipher}
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
@@ -6264,7 +6340,11 @@ func TestECHPoolProbeChannelRTTUpdatesAndExits(t *testing.T) {
 		}
 	}()
 
-	p := &ECHPool{channelRTT: []int64{0}}
+	p := &ECHPool{
+		channelRTT:     []int64{0},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
+	}
 	done := make(chan error, 1)
 	go p.probeChannelRTT(clientSession, 0, done)
 
@@ -6278,6 +6358,7 @@ func TestECHPoolProbeChannelRTTUpdatesAndExits(t *testing.T) {
 	}
 
 	_ = clientSession.Close()
+
 	select {
 	case err := <-done:
 		if err == nil {
@@ -6289,18 +6370,9 @@ func TestECHPoolProbeChannelRTTUpdatesAndExits(t *testing.T) {
 	if got := atomic.LoadUint64(&clientRTTProbeFailureSeq); got == 0 {
 		t.Fatal("clientRTTProbeFailureSeq = 0, want at least one failed probe")
 	}
-	_ = serverSession.Close()
-	select {
-	case <-serverDone:
-	case <-time.After(time.Second):
-		t.Fatal("server smux accept loop did not exit")
-	}
 }
 
-func TestNegotiateClientProtocolRejectsClosedControlStream(t *testing.T) {
-	oldToken := token
-	t.Cleanup(func() { token = oldToken })
-	token = "v2-close-token"
+func TestNegotiateClientProtocolHandlesControlStreamClose(t *testing.T) {
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6314,14 +6386,14 @@ func TestNegotiateClientProtocolRejectsClosedControlStream(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		if _, err := readChannelInit(stream, maxV2FrameSize); err != nil {
+		if _, err := readChannelInitV3(stream, maxV2FrameSize); err != nil {
 			serverDone <- err
 			return
 		}
 		serverDone <- nil
 	}()
 
-	caps, err := negotiateClientProtocol(clientSession, time.Second, uuid.NewString(), 1, "ws://example.com/tunnel")
+	caps, _, _, err := negotiateClientProtocol(clientSession, time.Second, uuid.NewString(), 1, "ws://example.com/tunnel")
 	if err == nil {
 		t.Fatal("negotiateClientProtocol closed control stream returned nil error")
 	}
@@ -6366,9 +6438,11 @@ func TestECHPoolOpenUDPStreamWritesHeader(t *testing.T) {
 	ipStrategy = IPStrategyPv4Pv6
 
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{currentProtocolCapabilitiesV2()},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{currentProtocolCapabilitiesV2()},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6378,11 +6452,16 @@ func TestECHPoolOpenUDPStreamWritesHeader(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -6391,7 +6470,7 @@ func TestECHPoolOpenUDPStreamWritesHeader(t *testing.T) {
 			serverDone <- fmt.Errorf("udp open header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		if err := writeUDPOpenSuccess(stream, currentProtocolCapabilitiesV2()); err != nil {
+		if err := writeUDPOpenSuccess(cs, currentProtocolCapabilitiesV2()); err != nil {
 			serverDone <- err
 			return
 		}
@@ -6423,9 +6502,11 @@ func TestECHPoolOpenUDPStreamStatusError(t *testing.T) {
 	ipStrategy = IPStrategyDefault
 
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityUDPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityUDPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6435,11 +6516,20 @@ func TestECHPoolOpenUDPStreamStatusError(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if _, _, _, err := readSmuxOpenHeader(stream); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		serverDone <- writeUDPOpenStatus(stream, udpOpenStatusError, "policy denied")
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, _, _, err := readSmuxOpenHeader(cs); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- writeUDPOpenStatus(cs, udpOpenStatusError, "policy denied")
 	}()
 
 	stream, _, _, err := pool.openUDPStream("example.com:53")
@@ -6466,9 +6556,11 @@ func TestECHPoolOpenUDPStreamStatusCodeError(t *testing.T) {
 	ipStrategy = IPStrategyDefault
 
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityUDPStatus | protocolCapabilityOpenStatusCode},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityUDPStatus | protocolCapabilityOpenStatusCode},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6478,11 +6570,20 @@ func TestECHPoolOpenUDPStreamStatusCodeError(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if _, _, _, err := readSmuxOpenHeader(stream); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		serverDone <- writeUDPOpenStatusCode(stream, udpOpenStatusError, openStatusCodeDialFailed, "dns failed")
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, _, _, err := readSmuxOpenHeader(cs); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- writeUDPOpenStatusCode(cs, udpOpenStatusError, openStatusCodeDialFailed, "dns failed")
 	}()
 
 	stream, _, _, err := pool.openUDPStream("example.com:53")
@@ -6509,9 +6610,11 @@ func TestECHPoolOpenTCPStreamStatusError(t *testing.T) {
 	ipStrategy = IPStrategyIPv6Only
 
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6521,11 +6624,16 @@ func TestECHPoolOpenTCPStreamStatusError(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -6534,7 +6642,7 @@ func TestECHPoolOpenTCPStreamStatusError(t *testing.T) {
 			serverDone <- fmt.Errorf("tcp open header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenStatus(stream, tcpOpenStatusError, "blocked by policy")
+		serverDone <- writeTCPOpenStatus(cs, tcpOpenStatusError, "blocked by policy")
 	}()
 
 	if stream, chID, decision, err := pool.openTCPStream("blocked.example:443"); err == nil {
@@ -6560,9 +6668,11 @@ func TestECHPoolOpenTCPStreamStatusCodeError(t *testing.T) {
 	ipStrategy = IPStrategyDefault
 
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6572,11 +6682,20 @@ func TestECHPoolOpenTCPStreamStatusCodeError(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if _, _, _, err := readSmuxOpenHeader(stream); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		serverDone <- writeTCPOpenStatusCode(stream, tcpOpenStatusError, openStatusCodePolicyDenied, "blocked by policy")
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, _, _, err := readSmuxOpenHeader(cs); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- writeTCPOpenStatusCode(cs, tcpOpenStatusError, openStatusCodePolicyDenied, "blocked by policy")
 	}()
 
 	if stream, _, _, err := pool.openTCPStream("blocked.example:443"); err == nil {
@@ -6602,9 +6721,11 @@ func TestECHPoolOpenTCPStreamStatusOK(t *testing.T) {
 	ipStrategy = IPStrategyPv6Pv4
 
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6614,11 +6735,16 @@ func TestECHPoolOpenTCPStreamStatusOK(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -6627,7 +6753,7 @@ func TestECHPoolOpenTCPStreamStatusOK(t *testing.T) {
 			serverDone <- fmt.Errorf("tcp open header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenStatus(stream, tcpOpenStatusOK, "")
+		serverDone <- writeTCPOpenStatus(cs, tcpOpenStatusOK, "")
 	}()
 
 	stream, chID, decision, err := pool.openTCPStream("ok.example:443")
@@ -6655,9 +6781,11 @@ func TestECHPoolOpenTCPStreamStatusCodeOK(t *testing.T) {
 	ipStrategy = IPStrategyDefault
 
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus | protocolCapabilityOpenStatusCode},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	serverDone := make(chan error, 1)
 	go func() {
@@ -6667,7 +6795,16 @@ func TestECHPoolOpenTCPStreamStatusCodeOK(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -6676,7 +6813,7 @@ func TestECHPoolOpenTCPStreamStatusCodeOK(t *testing.T) {
 			serverDone <- fmt.Errorf("tcp open header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		serverDone <- writeTCPOpenSuccess(stream, protocolCapabilityTCPStatus|protocolCapabilityOpenStatusCode)
+		serverDone <- writeTCPOpenSuccess(cs, protocolCapabilityTCPStatus|protocolCapabilityOpenStatusCode)
 	}()
 
 	stream, chID, decision, err := pool.openTCPStream("example.com:443")
@@ -6706,9 +6843,11 @@ func TestHandleLocalTCPProxiesOverSmux(t *testing.T) {
 
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	echPool = &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCPStatus},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 
 	serverDone := make(chan error, 1)
@@ -6719,11 +6858,16 @@ func TestHandleLocalTCPProxiesOverSmux(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -6732,12 +6876,12 @@ func TestHandleLocalTCPProxiesOverSmux(t *testing.T) {
 			serverDone <- fmt.Errorf("local TCP header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		if err := writeTCPOpenStatus(stream, tcpOpenStatusOK, ""); err != nil {
+		if err := writeTCPOpenStatus(cs, tcpOpenStatusOK, ""); err != nil {
 			serverDone <- err
 			return
 		}
 		request := make([]byte, len("tcp-forward-request"))
-		if _, err := io.ReadFull(stream, request); err != nil {
+		if _, err := io.ReadFull(cs, request); err != nil {
 			serverDone <- err
 			return
 		}
@@ -6745,7 +6889,7 @@ func TestHandleLocalTCPProxiesOverSmux(t *testing.T) {
 			serverDone <- fmt.Errorf("local TCP request = %q", request)
 			return
 		}
-		serverDone <- writeAll(stream, []byte("tcp-forward-response"))
+		serverDone <- writeAll(cs, []byte("tcp-forward-response"))
 	}()
 
 	localServer, localClient := net.Pipe()
@@ -6781,7 +6925,7 @@ func TestHandleLocalTCPProxiesOverSmux(t *testing.T) {
 
 func TestECHPoolOpenBestStreamNoUsableSessions(t *testing.T) {
 	pool := &ECHPool{}
-	if _, _, _, _, err := pool.openBestStream(); err == nil {
+	if _, _, _, _, _, _, err := pool.openBestStream(); err == nil {
 		t.Fatal("openBestStream with empty pool returned nil error")
 	}
 
@@ -6792,7 +6936,7 @@ func TestECHPoolOpenBestStreamNoUsableSessions(t *testing.T) {
 		smuxConns:  []*smux.Session{nil, clientSession},
 		channelRTT: []int64{0, 0},
 	}
-	if _, _, _, _, err := pool.openBestStream(); err == nil {
+	if _, _, _, _, _, _, err := pool.openBestStream(); err == nil {
 		t.Fatal("openBestStream with nil/closed sessions returned nil error")
 	}
 }
@@ -6801,34 +6945,39 @@ func TestECHPoolOpenBestStreamSkipsNilSessions(t *testing.T) {
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	waitAccepted := expectAcceptedSmuxStream(t, serverSession)
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{nil, clientSession},
-		channelRTT:  []int64{0, int64(5 * time.Millisecond)},
-		channelCaps: []uint64{0, protocolCapabilityTCPStatus},
+		smuxConns:      []*smux.Session{nil, clientSession},
+		channelRTT:     []int64{0, int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{0, protocolCapabilityTCP},
+		channelKeys:    []V3SessionKeys{{}, testV3Keys},
+		channelCiphers: []byte{0, testV3Cipher},
 	}
 
-	stream, chID, decision, caps, err := pool.openBestStream()
+	stream, chID, decision, caps, _, _, err := pool.openBestStream()
 	if err != nil {
 		t.Fatalf("openBestStream returned error: %v", err)
 	}
 	_ = stream.Close()
-	if chID != 2 || decision != 2 || caps != protocolCapabilityTCPStatus {
-		t.Fatalf("openBestStream = chID %d decision %d caps 0x%x, want 2/2/TCPStatus", chID, decision, caps)
+	if chID != 2 || decision != 2 || caps != protocolCapabilityTCP {
+		t.Fatalf("openBestStream = chID %d decision %d caps 0x%x, want 2/2/TCP", chID, decision, caps)
 	}
 	waitAccepted()
 }
 
-func TestECHPoolOpenBestStreamRoundRobinNearRTT(t *testing.T) {
+func TestECHPoolOpenBestStreamNearRTTSelection(t *testing.T) {
 	serverSession1, clientSession1 := newProtocolNegotiationSmuxPair(t)
 	serverSession2, clientSession2 := newProtocolNegotiationSmuxPair(t)
 	waitAccepted1 := expectAcceptedSmuxStream(t, serverSession1)
 	waitAccepted2 := expectAcceptedSmuxStream(t, serverSession2)
+
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession1, clientSession2},
-		channelRTT:  []int64{int64(5 * time.Millisecond), int64(8 * time.Millisecond)},
-		channelCaps: []uint64{protocolCapabilityTCP, protocolCapabilityUDP},
+		smuxConns:      []*smux.Session{clientSession1, clientSession2},
+		channelRTT:     []int64{int64(5 * time.Millisecond), int64(8 * time.Millisecond)},
+		channelCaps:    []uint64{protocolCapabilityTCP, protocolCapabilityUDP},
+		channelKeys:    []V3SessionKeys{testV3Keys, testV3Keys},
+		channelCiphers: []byte{testV3Cipher, testV3Cipher},
 	}
 
-	stream, chID, decision, caps, err := pool.openBestStream()
+	stream, chID, decision, caps, _, _, err := pool.openBestStream()
 	if err != nil {
 		t.Fatalf("first openBestStream returned error: %v", err)
 	}
@@ -6837,7 +6986,7 @@ func TestECHPoolOpenBestStreamRoundRobinNearRTT(t *testing.T) {
 		t.Fatalf("first openBestStream = chID %d decision %d caps 0x%x, want 1/1/TCP", chID, decision, caps)
 	}
 
-	stream, chID, decision, caps, err = pool.openBestStream()
+	stream, chID, decision, caps, _, _, err = pool.openBestStream()
 	if err != nil {
 		t.Fatalf("second openBestStream returned error: %v", err)
 	}
@@ -7802,20 +7951,28 @@ func TestUDPAssociationHandleUDPResponseWritesSOCKS5Packet(t *testing.T) {
 
 func TestUDPAssociationSendWritesBoundTarget(t *testing.T) {
 	clientStream, serverStream := openRawAcceptedSmuxTestStream(t)
+	csClient, err := newV3CipherStream(clientStream, testV3Keys, testV3Cipher, clientStream.ID(), true)
+	if err != nil {
+		t.Fatalf("new client cipher stream: %v", err)
+	}
+	csServer, err := newV3CipherStream(serverStream, testV3Keys, testV3Cipher, serverStream.ID(), false)
+	if err != nil {
+		t.Fatalf("new server cipher stream: %v", err)
+	}
 	assoc := &UDPAssociation{
 		id:        1,
 		receiving: true,
 		target:    "127.0.0.1:53",
-		stream:    clientStream,
+		stream:    csClient,
 	}
 	payload := []byte("dns-query")
 
 	assoc.send("127.0.0.1:53", payload)
 
-	if err := serverStream.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := csServer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set server stream deadline: %v", err)
 	}
-	got, err := readChunk(serverStream)
+	got, err := readChunk(csServer)
 	if err != nil {
 		t.Fatalf("read UDP stream chunk: %v", err)
 	}
@@ -7826,22 +7983,29 @@ func TestUDPAssociationSendWritesBoundTarget(t *testing.T) {
 
 func TestUDPAssociationSendDropsChangedTarget(t *testing.T) {
 	clientStream, serverStream := openRawAcceptedSmuxTestStream(t)
+	csClient, err := newV3CipherStream(clientStream, testV3Keys, testV3Cipher, clientStream.ID(), true)
+	if err != nil {
+		t.Fatalf("new client cipher stream: %v", err)
+	}
+	csServer, err := newV3CipherStream(serverStream, testV3Keys, testV3Cipher, serverStream.ID(), false)
+	if err != nil {
+		t.Fatalf("new server cipher stream: %v", err)
+	}
 	assoc := &UDPAssociation{
 		id:        2,
 		receiving: true,
 		target:    "127.0.0.1:53",
-		stream:    clientStream,
+		stream:    csClient,
 	}
-
-	assoc.send("127.0.0.1:54", []byte("leak"))
+	assoc.send("192.0.2.1:53", []byte("drop-me"))
 
 	if assoc.target != "127.0.0.1:53" {
 		t.Fatalf("association target = %q, want original target", assoc.target)
 	}
-	if err := serverStream.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+	if err := csServer.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		t.Fatalf("set server stream deadline: %v", err)
 	}
-	if got, err := readChunk(serverStream); err == nil {
+	if got, err := readChunk(csServer); err == nil {
 		t.Fatalf("changed target wrote UDP stream chunk %q", got)
 	}
 }
@@ -7872,9 +8036,11 @@ func TestUDPAssociationLoopSendsParsedPacketOverSmux(t *testing.T) {
 	defer tcpClient.Close()
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	pool := &ECHPool{
-		smuxConns:   []*smux.Session{clientSession},
-		channelRTT:  []int64{int64(5 * time.Millisecond)},
-		channelCaps: []uint64{currentProtocolCapabilitiesV2()},
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{currentProtocolCapabilitiesV2()},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
 	}
 	assoc := &UDPAssociation{
 		id:          3,
@@ -7893,11 +8059,16 @@ func TestUDPAssociationLoopSendsParsedPacketOverSmux(t *testing.T) {
 			return
 		}
 		defer stream.Close()
-		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		cs, err := newV3CipherStream(stream, testV3Keys, testV3Cipher, stream.ID(), false)
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		kind, strategy, target, err := readSmuxOpenHeader(stream)
+		if err := cs.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		kind, strategy, target, err := readSmuxOpenHeader(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -7906,11 +8077,11 @@ func TestUDPAssociationLoopSendsParsedPacketOverSmux(t *testing.T) {
 			serverDone <- fmt.Errorf("UDP association header = kind %d strategy %d target %q", kind, strategy, target)
 			return
 		}
-		if err := writeUDPOpenSuccess(stream, currentProtocolCapabilitiesV2()); err != nil {
+		if err := writeUDPOpenSuccess(cs, currentProtocolCapabilitiesV2()); err != nil {
 			serverDone <- err
 			return
 		}
-		chunk, err := readChunk(stream)
+		chunk, err := readChunk(cs)
 		if err != nil {
 			serverDone <- err
 			return
@@ -7922,24 +8093,30 @@ func TestUDPAssociationLoopSendsParsedPacketOverSmux(t *testing.T) {
 		serverDone <- nil
 	}()
 
-	go assoc.loop()
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		assoc.loop()
+	}()
+
 	packet, err := buildSOCKS5UDPPacket("8.8.8.8", 53, []byte("dns-query"))
 	if err != nil {
 		t.Fatalf("build SOCKS5 UDP packet: %v", err)
 	}
-	if _, err := clientConn.WriteToUDP(packet, relayConn.LocalAddr().(*net.UDPAddr)); err != nil {
-		t.Fatalf("write SOCKS5 UDP packet: %v", err)
+	if _, err := clientConn.WriteTo(packet, relayConn.LocalAddr()); err != nil {
+		t.Fatalf("write parsed UDP packet: %v", err)
 	}
 
-	select {
-	case err := <-serverDone:
-		if err != nil {
-			t.Fatalf("server UDP association handler: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for UDP association smux packet")
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server UDP association handler: %v", err)
 	}
+
 	assoc.Close()
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for UDP association loop exit")
+	}
 }
 
 func TestUDPAssociationLoopDropsBlockedPort(t *testing.T) {
@@ -7950,57 +8127,76 @@ func TestUDPAssociationLoopDropsBlockedPort(t *testing.T) {
 		udpBlockPorts = oldBlockPorts
 	})
 	ipStrategy = IPStrategyDefault
-	udpBlockPorts = map[int]struct{}{443: {}}
+	udpBlockPorts = map[int]struct{}{53: {}}
 
 	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatalf("listen relay udp: %v", err)
 	}
+	defer relayConn.Close()
 	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
-		_ = relayConn.Close()
 		t.Fatalf("listen client udp: %v", err)
 	}
 	defer clientConn.Close()
 
 	tcpServer, tcpClient := net.Pipe()
+	defer tcpServer.Close()
 	defer tcpClient.Close()
+	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
+	pool := &ECHPool{
+		smuxConns:      []*smux.Session{clientSession},
+		channelRTT:     []int64{int64(5 * time.Millisecond)},
+		channelCaps:    []uint64{currentProtocolCapabilitiesV2()},
+		channelKeys:    []V3SessionKeys{testV3Keys},
+		channelCiphers: []byte{testV3Cipher},
+	}
 	assoc := &UDPAssociation{
 		id:          4,
 		tcpConn:     tcpServer,
 		udpListener: relayConn,
+		pool:        pool,
+		active:      true,
 		channelID:   -1,
 	}
-	defer assoc.Close()
 
-	go assoc.loop()
-	packet, err := buildSOCKS5UDPPacket("8.8.8.8", 443, []byte("blocked-quic"))
+	serverDone := make(chan error, 1)
+	go func() {
+		stream, err := serverSession.AcceptStream()
+		if err == nil {
+			_ = stream.Close()
+			serverDone <- fmt.Errorf("blocked UDP port opened smux stream")
+			return
+		}
+		serverDone <- nil
+	}()
+
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		assoc.loop()
+	}()
+
+	packet, err := buildSOCKS5UDPPacket("8.8.8.8", 53, []byte("dns-query"))
 	if err != nil {
 		t.Fatalf("build SOCKS5 UDP packet: %v", err)
 	}
-	if _, err := clientConn.WriteToUDP(packet, relayConn.LocalAddr().(*net.UDPAddr)); err != nil {
-		t.Fatalf("write SOCKS5 UDP packet: %v", err)
+	if _, err := clientConn.WriteTo(packet, relayConn.LocalAddr()); err != nil {
+		t.Fatalf("write parsed UDP packet: %v", err)
 	}
 
-	deadline := time.After(time.Second)
-	for {
-		assoc.mu.Lock()
-		clientSeen := assoc.clientUDPAddr != nil
-		receiving := assoc.receiving
-		target := assoc.target
-		stream := assoc.stream
-		assoc.mu.Unlock()
-		if clientSeen {
-			if receiving || target != "" || stream != nil {
-				t.Fatalf("blocked UDP packet bound association: receiving=%v target=%q stream=%v", receiving, target, stream)
-			}
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for blocked UDP packet to reach association loop")
-		case <-time.After(5 * time.Millisecond):
-		}
+	time.Sleep(50 * time.Millisecond)
+	assoc.Close()
+	_ = serverSession.Close()
+	_ = clientSession.Close()
+
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server unexpected stream: %v", err)
+	}
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocked UDP association loop exit")
 	}
 }
 
@@ -8093,5 +8289,282 @@ func TestExampleConfigFilesLoad(t *testing.T) {
 				t.Fatalf("validateStartupConfig(%s): %v", path, err)
 			}
 		})
+	}
+}
+
+func writeTestTLV(w *bytes.Buffer, typ uint16, val []byte) {
+	var head [4]byte
+	binary.BigEndian.PutUint16(head[0:2], typ)
+	binary.BigEndian.PutUint16(head[2:4], uint16(len(val)))
+	w.Write(head[:])
+	w.Write(val)
+}
+
+func writeRawV3Frame(w io.Writer, frameType byte, version byte, body []byte) error {
+	var head [8]byte
+	head[0] = frameType
+	head[1] = version
+	binary.BigEndian.PutUint16(head[2:4], 0)
+	binary.BigEndian.PutUint32(head[4:8], uint32(len(body)))
+	if err := writeAll(w, head[:]); err != nil {
+		return err
+	}
+	return writeAll(w, body)
+}
+
+func TestPreAuthRejectsUnsupportedCipher(t *testing.T) {
+	oldToken := token
+	t.Cleanup(func() { token = oldToken })
+	token = "v3-reject-test-token"
+
+	clientConn, serverConn := newTestWSNetConnPair(t)
+	go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
+
+	clientSess, err := smux.Client(clientConn, nil)
+	if err != nil {
+		t.Fatalf("smux.Client: %v", err)
+	}
+	defer clientSess.Close()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("clientSess.OpenStream: %v", err)
+	}
+	defer stream.Close()
+
+	sessionID := bytes.Repeat([]byte{0x11}, 16)
+	nonce := bytes.Repeat([]byte{0x22}, 32)
+	now := time.Now().Unix()
+
+	init := ChannelInit{
+		SessionID:    sessionID,
+		ChannelID:    1,
+		ClientNonce:  nonce,
+		Timestamp:    now,
+		Capabilities: currentProtocolCapabilitiesV2(),
+		CipherPref:   []byte{99, 1},
+	}
+	proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
+	if err != nil {
+		t.Fatalf("computeV3AuthProof: %v", err)
+	}
+
+	var body bytes.Buffer
+	writeTestTLV(&body, 0x8001, sessionID)
+	var chanIDBytes [4]byte
+	binary.BigEndian.PutUint32(chanIDBytes[:], 1)
+	writeTestTLV(&body, 0x8002, chanIDBytes[:])
+	writeTestTLV(&body, 0x8003, nonce)
+	var timeBytes [8]byte
+	binary.BigEndian.PutUint64(timeBytes[:], uint64(now))
+	writeTestTLV(&body, 0x8004, timeBytes[:])
+	var capsBytes [8]byte
+	binary.BigEndian.PutUint64(capsBytes[:], currentProtocolCapabilitiesV2())
+	writeTestTLV(&body, 0x8005, capsBytes[:])
+	writeTestTLV(&body, 0x8006, proof)
+	writeTestTLV(&body, 0x8030, []byte{99, 1})
+
+	if err := writeRawV3Frame(stream, 1, 3, body.Bytes()); err != nil {
+		t.Fatalf("writeRawV3Frame: %v", err)
+	}
+
+	_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+	if err != nil {
+		t.Fatalf("readChannelAcceptOrRejectV3: %v", err)
+	}
+	if reject.Code == 0 {
+		t.Fatal("expected reject code, got accept")
+	}
+	if reject.Code != v2RejectMalformedFrame && reject.Code != v3RejectUnsupportedCipher {
+		t.Fatalf("reject.Code = %d, want MalformedFrame or UnsupportedCipher", reject.Code)
+	}
+}
+
+func TestPreAuthRejectsTamperedAuthProof(t *testing.T) {
+	oldToken := token
+	t.Cleanup(func() { token = oldToken })
+	token = "v3-tamper-test-token"
+
+	clientConn, serverConn := newTestWSNetConnPair(t)
+	go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
+
+	clientSess, err := smux.Client(clientConn, nil)
+	if err != nil {
+		t.Fatalf("smux.Client: %v", err)
+	}
+	defer clientSess.Close()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("clientSess.OpenStream: %v", err)
+	}
+	defer stream.Close()
+
+	sessionID := bytes.Repeat([]byte{0x33}, 16)
+	nonce := bytes.Repeat([]byte{0x44}, 32)
+	now := time.Now().Unix()
+
+	init := ChannelInit{
+		SessionID:    sessionID,
+		ChannelID:    1,
+		ClientNonce:  nonce,
+		Timestamp:    now,
+		Capabilities: currentProtocolCapabilitiesV2(),
+		CipherPref:   defaultCipherPreference,
+	}
+	proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
+	if err != nil {
+		t.Fatalf("computeV3AuthProof: %v", err)
+	}
+	proof[0] ^= 0xff
+	init.AuthProof = proof
+
+	if err := writeChannelInitV3(stream, init); err != nil {
+		t.Fatalf("writeChannelInitV3: %v", err)
+	}
+
+	_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+	if err != nil {
+		t.Fatalf("readChannelAcceptOrRejectV3: %v", err)
+	}
+	if reject.Code != v2RejectAuthenticationFailed {
+		t.Fatalf("reject.Code = %d, want AuthenticationFailed (%d)", reject.Code, v2RejectAuthenticationFailed)
+	}
+}
+
+func TestPreAuthRejectsV2Frame(t *testing.T) {
+	oldToken := token
+	t.Cleanup(func() { token = oldToken })
+	token = "v3-version-test-token"
+
+	clientConn, serverConn := newTestWSNetConnPair(t)
+	go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
+
+	clientSess, err := smux.Client(clientConn, nil)
+	if err != nil {
+		t.Fatalf("smux.Client: %v", err)
+	}
+	defer clientSess.Close()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("clientSess.OpenStream: %v", err)
+	}
+	defer stream.Close()
+
+	sessionID := bytes.Repeat([]byte{0x55}, 16)
+	nonce := bytes.Repeat([]byte{0x66}, 32)
+	now := time.Now().Unix()
+
+	init := ChannelInit{
+		SessionID:    sessionID,
+		ChannelID:    1,
+		ClientNonce:  nonce,
+		Timestamp:    now,
+		Capabilities: currentProtocolCapabilitiesV2(),
+	}
+	proof, err := computeV2AuthProof(token, "example.com", "/tunnel", init)
+	if err != nil {
+		t.Fatalf("computeV2AuthProof: %v", err)
+	}
+	init.AuthProof = proof
+
+	if err := writeChannelInit(stream, init); err != nil {
+		t.Fatalf("writeChannelInit: %v", err)
+	}
+
+	_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+	if err != nil {
+		t.Fatalf("readChannelAcceptOrRejectV3: %v", err)
+	}
+	if reject.Code != v2RejectMalformedFrame {
+		t.Fatalf("reject.Code = %d, want MalformedFrame (%d)", reject.Code, v2RejectMalformedFrame)
+	}
+}
+
+func TestPreAuthRejectsReplay(t *testing.T) {
+	oldToken := token
+	t.Cleanup(func() { token = oldToken })
+	token = "v3-replay-test-token"
+
+	sessionID := bytes.Repeat([]byte{0x77}, 16)
+	nonce := bytes.Repeat([]byte{0x88}, 32)
+	now := time.Now().Unix()
+
+	init := ChannelInit{
+		SessionID:    sessionID,
+		ChannelID:    1,
+		ClientNonce:  nonce,
+		Timestamp:    now,
+		Capabilities: currentProtocolCapabilitiesV2(),
+		CipherPref:   defaultCipherPreference,
+	}
+	proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
+	if err != nil {
+		t.Fatalf("computeV3AuthProof: %v", err)
+	}
+	init.AuthProof = proof
+
+	// First connection: should succeed
+	{
+		clientConn, serverConn := newTestWSNetConnPair(t)
+		go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
+
+		clientSess, err := smux.Client(clientConn, nil)
+		if err != nil {
+			t.Fatalf("smux.Client 1: %v", err)
+		}
+		defer clientSess.Close()
+
+		stream, err := clientSess.OpenStream()
+		if err != nil {
+			t.Fatalf("clientSess.OpenStream 1: %v", err)
+		}
+		defer stream.Close()
+
+		if err := writeChannelInitV3(stream, init); err != nil {
+			t.Fatalf("writeChannelInitV3 1: %v", err)
+		}
+
+		accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+		if err != nil {
+			t.Fatalf("readChannelAcceptOrRejectV3 1: %v", err)
+		}
+		if reject.Code != 0 {
+			t.Fatalf("first connection rejected: %d %s", reject.Code, reject.Message)
+		}
+		if accept.Cipher != protocolCipherChaCha20Poly1305 {
+			t.Fatalf("accept.Cipher = %d, want %d", accept.Cipher, protocolCipherChaCha20Poly1305)
+		}
+	}
+
+	// Second connection with same ChannelInit: must be rejected with ReplayDetected
+	{
+		clientConn, serverConn := newTestWSNetConnPair(t)
+		go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
+
+		clientSess, err := smux.Client(clientConn, nil)
+		if err != nil {
+			t.Fatalf("smux.Client 2: %v", err)
+		}
+		defer clientSess.Close()
+
+		stream, err := clientSess.OpenStream()
+		if err != nil {
+			t.Fatalf("clientSess.OpenStream 2: %v", err)
+		}
+		defer stream.Close()
+
+		if err := writeChannelInitV3(stream, init); err != nil {
+			t.Fatalf("writeChannelInitV3 2: %v", err)
+		}
+
+		_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+		if err != nil {
+			t.Fatalf("readChannelAcceptOrRejectV3 2: %v", err)
+		}
+		if reject.Code != v2RejectReplayDetected {
+			t.Fatalf("reject.Code = %d, want ReplayDetected (%d)", reject.Code, v2RejectReplayDetected)
+		}
 	}
 }
