@@ -154,9 +154,12 @@ var (
 	checkConfigFile     string
 	formatConfigFile    string
 
-	dnsServer string
-	echDomain string
-	fallback  bool
+	dnsServer    string
+	echDomain    string
+	fallback     bool
+	rulesPath    string
+	geoDir       string
+	routeEnabled bool
 
 	echListMu sync.RWMutex
 	echList   []byte
@@ -251,6 +254,9 @@ func init() {
 	flag.StringVar(&controlTokenFile, "control-token-file", "", "可选控制 API bearer token 文件路径，需配合 -control 使用")
 	flag.StringVar(&checkConfigFile, "check-config", "", "离线校验 JSON 配置文件并退出；使用 - 从 stdin 读取")
 	flag.StringVar(&formatConfigFile, "format-config", "", "离线格式化 JSON 配置文件到 stdout 并退出；使用 - 从 stdin 读取")
+	flag.StringVar(&rulesPath, "rules-path", "", "可选分流规则文件路径（route-enabled 时必填或自动写默认模板）")
+	flag.StringVar(&geoDir, "geo-dir", "", "可选 GEO 数据库目录（geosite.dat / geoip-lite.dat）")
+	flag.BoolVar(&routeEnabled, "route-enabled", false, "是否启用分流引擎（GEO/域名规则）；服务端默认关闭")
 	flag.DurationVar(&cfg.DialTimeout, "dial-timeout", cfg.DialTimeout, "TCP/DNS 目标拨号超时时间")
 	flag.DurationVar(&cfg.WSHandshakeTimeout, "ws-handshake-timeout", cfg.WSHandshakeTimeout, "WebSocket 握手超时时间")
 	flag.DurationVar(&cfg.ReconnectDelay, "reconnect-delay", cfg.ReconnectDelay, "客户端重连初始退避时间")
@@ -318,6 +324,9 @@ type FileConfig struct {
 	ShutdownTimeout     *string                    `json:"shutdown_timeout"`
 	AuthSkew            *string                    `json:"auth_skew"`
 	PreAuthTimeout      *string                    `json:"preauth_timeout"`
+	RulesPath           *string                    `json:"rules_path"`
+	GeoDir              *string                    `json:"geo_dir"`
+	RouteEnabled        *bool                      `json:"route_enabled"`
 }
 
 func visitedFlags() map[string]bool {
@@ -357,6 +366,9 @@ type runtimeValues struct {
 	Fallback            bool
 	Global              GlobalConfig
 	WebSocketFrontProxy WebSocketFrontProxyConfig
+	RulesPath           string
+	GeoDir              string
+	RouteEnabled        bool
 }
 
 type RuntimeConfig struct {
@@ -393,6 +405,9 @@ func currentRuntimeValues() runtimeValues {
 		Fallback:            fallback,
 		Global:              cfg,
 		WebSocketFrontProxy: cloneWebSocketFrontProxyConfig(websocketFrontProxyConfig),
+		RulesPath:           rulesPath,
+		GeoDir:              geoDir,
+		RouteEnabled:        routeEnabled,
 	}
 }
 
@@ -434,6 +449,9 @@ func (values runtimeValues) applyGlobals() {
 	fallback = values.Fallback
 	cfg = values.Global
 	websocketFrontProxyConfig = cloneWebSocketFrontProxyConfig(values.WebSocketFrontProxy)
+	rulesPath = values.RulesPath
+	geoDir = values.GeoDir
+	routeEnabled = values.RouteEnabled
 }
 
 func newRuntimeConfig(values runtimeValues, startup *startupConfig) RuntimeConfig {
@@ -602,6 +620,11 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	applyStringConfig(seen, "dns", fc.DNS, &values.DNSServer)
 	applyStringConfig(seen, "ech", fc.ECH, &values.ECHDomain)
 	applyStringConfig(seen, "ips", fc.IPS, &values.IPS)
+	applyStringConfig(seen, "rules-path", fc.RulesPath, &values.RulesPath)
+	applyStringConfig(seen, "geo-dir", fc.GeoDir, &values.GeoDir)
+	if fc.RouteEnabled != nil && !seen["route-enabled"] {
+		values.RouteEnabled = *fc.RouteEnabled
+	}
 	if fc.Connections != nil && !seen["n"] {
 		values.ConnectionNum = *fc.Connections
 	}

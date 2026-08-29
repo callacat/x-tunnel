@@ -85,6 +85,19 @@ func handleHTTP(c net.Conn, cfgp *ProxyConfig) {
 		req.URL.Scheme = ""
 		req.URL.Host = ""
 	}
+	buffered := readBufferedHTTPBytes(br)
+
+	// 分流判定（§1.2）：HTTP 目标 host 来自 target（去掉端口）。
+	host := httpHostOfTarget(target)
+	routeHost, routeIP := routeRT.resolveHostForRoute(host)
+	switch decideForTarget(routeHost, routeIP) {
+	case routeDirect:
+		handleDirectHTTP(c, target, req, buffered)
+		return
+	case routeReject:
+		_ = writeHTTPProxyResponse(c, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+		return
+	}
 
 	stream, _, decision, err := echPool.openTCPStream(target)
 	if err != nil {
@@ -98,9 +111,11 @@ func handleHTTP(c net.Conn, cfgp *ProxyConfig) {
 			_ = stream.Close()
 			return
 		}
-		if err := forwardBufferedHTTPBytes(br, stream); err != nil {
-			_ = stream.Close()
-			return
+		if len(buffered) > 0 {
+			if err := writeAll(stream, buffered); err != nil {
+				_ = stream.Close()
+				return
+			}
 		}
 	}
 	if req.Method != "CONNECT" {
@@ -167,16 +182,24 @@ func sanitizeHTTPProxyRequest(req *http.Request) {
 	req.Close = false
 }
 
-func forwardBufferedHTTPBytes(br *bufio.Reader, stream io.Writer) error {
+func readBufferedHTTPBytes(br *bufio.Reader) []byte {
 	buffered := br.Buffered()
 	if buffered == 0 {
 		return nil
 	}
 	data := make([]byte, buffered)
 	if _, err := io.ReadFull(br, data); err != nil {
-		return err
+		return nil
 	}
-	return writeAll(stream, data)
+	return data
+}
+
+func httpHostOfTarget(target string) string {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return strings.Trim(target, "[]")
+	}
+	return host
 }
 
 func httpProxyTarget(req *http.Request) (string, error) {

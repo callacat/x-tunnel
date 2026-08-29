@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"x-tunnel/internal/route"
 )
 
 type controlServer struct {
@@ -80,6 +82,9 @@ func startControlServer(ctx context.Context, engine *Engine, addr, tokenFile str
 	mux.Handle("/v1/config/check", control.requireAuth(http.HandlerFunc(control.handleConfigCheck)))
 	mux.Handle("/v1/config/format", control.requireAuth(http.HandlerFunc(control.handleConfigFormat)))
 	mux.Handle("/v1/runtime/stop", control.requireAuth(http.HandlerFunc(control.handleStop)))
+	mux.Handle("/v1/rules", control.requireAuth(http.HandlerFunc(control.handleRules)))
+	mux.Handle("/v1/rules/reload", control.requireAuth(http.HandlerFunc(control.handleRulesReload)))
+	mux.Handle("/v1/route/stats", control.requireAuth(http.HandlerFunc(control.handleRouteStats)))
 	control.server = &http.Server{Handler: mux}
 	control.listener = newRuntimeListener("control", addr, control.baseURL, func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), engine.config.values.Global.ShutdownTimeout)
@@ -359,6 +364,61 @@ func (s *controlServer) handleStop(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		_ = s.engine.Close(ctx)
 	}()
+}
+
+// handleRules 返回当前生效的规则列表 + 引擎是否启用（读）。
+func (s *controlServer) handleRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
+		return
+	}
+	engine, enabled := s.engine.routeSnapshot()
+	if engine == nil {
+		writeControlJSON(w, http.StatusOK, map[string]any{"enabled": enabled, "rules": []route.Rule{}})
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"enabled": true, "rules": engine.Rules()})
+}
+
+// handleRulesReload 手动重新加载规则文件（写）。
+func (s *controlServer) handleRulesReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
+		return
+	}
+	engine, enabled := s.engine.routeSnapshot()
+	if engine == nil {
+		writeControlError(w, http.StatusConflict, "route.disabled", "分流引擎未启用", "")
+		return
+	}
+	if err := engine.Reload(); err != nil {
+		writeControlError(w, http.StatusBadRequest, "route.reload_failed", err.Error(), "")
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": enabled, "rules": engine.Rules()})
+}
+
+// handleRouteStats 返回分流命中统计（读）。
+func (s *controlServer) handleRouteStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
+		return
+	}
+	engine, _ := s.engine.routeSnapshot()
+	if engine == nil {
+		writeControlJSON(w, http.StatusOK, map[string]any{"enabled": false, "stats": route.Stats{}})
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"enabled": true, "stats": engine.Stats()})
+}
+
+// routeSnapshot 返回分流引擎引用与启用标志（并发安全读）。
+func (e *Engine) routeSnapshot() (*route.Engine, bool) {
+	e.mu.Lock()
+	engine := e.routeEngine
+	enabled := e.config.values.RouteEnabled
+	e.mu.Unlock()
+	return engine, enabled
 }
 
 type controlError struct {

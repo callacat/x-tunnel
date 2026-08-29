@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"x-tunnel/internal/route"
 )
 
 type Logger interface {
@@ -47,6 +48,8 @@ type Engine struct {
 	logs      *LogRing
 	logUndo   func()
 	fatalErr  error
+
+	routeEngine *route.Engine
 }
 
 func NewEngine(config RuntimeConfig, options RuntimeOptions) (*Engine, error) {
@@ -219,6 +222,14 @@ func (e *Engine) startRuntime() error {
 	clientID = uuid.NewString()
 	log.Printf("[客户端] 客户端ID: %s", clientID)
 
+	// 分流引擎初始化（仅客户端）：route_enabled 时按 rules_path/geo_dir 装配。
+	// 挂载到全局 routeRT 供 SOCKS5/HTTP 接入点读取；服务端不启用（方案 §3）。
+	if e.config.values.RouteEnabled {
+		if err := e.initRouteEngine(); err != nil {
+			return fmt.Errorf("route.init_failed: %w", err)
+		}
+	}
+
 	echPool = NewECHPool(e.config.values.ForwardAddr, e.config.values.ConnectionNum, startup.TargetIPs, clientID)
 	preResolveDialTargets(startup)
 	echPool.Start(e.ctx)
@@ -327,11 +338,17 @@ func (e *Engine) Close(ctx context.Context) error {
 	e.closed = true
 	cancel := e.cancel
 	listeners := append([]*runtimeListener(nil), e.listeners...)
+	routeEngine := e.routeEngine
+	e.routeEngine = nil
 	done := e.done
 	e.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	if routeEngine != nil {
+		routeEngine.Close()
+		routeRT.setEngine(nil)
 	}
 	for _, listener := range listeners {
 		_ = listener.Close()
