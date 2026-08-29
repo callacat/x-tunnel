@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -267,24 +269,58 @@ func negotiateClientProtocol(sess *smux.Session, timeout time.Duration, clientID
 	if err != nil {
 		return 0, V3SessionKeys{}, 0, err
 	}
+
+	clientSk, clientPk, err := newV3ClientEphemeralKey()
+	if err != nil {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("生成客户端 ephemeral 密钥失败: %w", err)
+	}
+	defer func() {
+		for i := range clientSk {
+			clientSk[i] = 0
+		}
+	}()
+
+	now := time.Now()
 	init := ChannelInit{
 		SessionID:    sessionID,
 		ChannelID:    channelID,
 		ClientNonce:  nonce,
-		Timestamp:    time.Now().Unix(),
-		Capabilities: currentProtocolCapabilitiesV2(),
+		Timestamp:    now.Unix(),
+		Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
 		CipherPref:   defaultCipherPreference,
+		ClientEphPK:  clientPk,
+		TAI64N:       encodeTAI64N(now),
 	}
 	proof, err := computeV3AuthProof(token, serverName, serverPath, init)
 	if err != nil {
 		return 0, V3SessionKeys{}, 0, err
 	}
 	init.AuthProof = proof
+
+	unpaddedBody, err := encodeChannelInitV3(init)
+	if err != nil {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("编码 ChannelInit 失败: %w", err)
+	}
+	frameLen := 8 + len(unpaddedBody)
+	if target, ok := sampleFirstPacketTarget(frameLen); ok {
+		padLen := target - frameLen - 4
+		if padLen >= 0 {
+			pad := make([]byte, padLen)
+			if _, err := rand.Read(pad); err != nil {
+				return 0, V3SessionKeys{}, 0, fmt.Errorf("生成首包 padding 失败: %w", err)
+			}
+			init.Padding = pad
+		}
+	}
+
 	if err := writeChannelInitV3(s, init); err != nil {
 		return 0, V3SessionKeys{}, 0, err
 	}
 	accept, reject, err := readChannelAcceptOrRejectV3(s, maxV2FrameSize)
 	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || err == io.EOF || err == io.ErrUnexpectedEOF {
+			return 0, V3SessionKeys{}, 0, errors.New("连接被服务端关闭")
+		}
 		return 0, V3SessionKeys{}, 0, err
 	}
 	if reject.Code != 0 {
@@ -299,15 +335,28 @@ func negotiateClientProtocol(sess *smux.Session, timeout time.Duration, clientID
 		}
 		return 0, V3SessionKeys{}, 0, fmt.Errorf("协议协商失败: reject=%d", reject.Code)
 	}
-	required := requiredProtocolCapabilitiesV2()
+	required := requiredProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy
 	if accept.Capabilities&required != required {
 		return 0, V3SessionKeys{}, 0, fmt.Errorf("协议能力不足: caps=0x%x", accept.Capabilities)
 	}
-	th, err := computeV3TranscriptHash(serverName, serverPath, init)
+	if len(accept.ServerEphPK) != 32 || len(accept.ServerProof) != 32 {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("服务端证明或公钥格式非法")
+	}
+
+	shared, err := computeV3SharedSecret(clientSk, accept.ServerEphPK)
+	if err != nil {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("计算共享秘密失败: %w", err)
+	}
+
+	if !verifyV3ServerProof(token, serverName, serverPath, init, accept) {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("服务端证明校验失败")
+	}
+
+	thFull, err := computeV3TranscriptHashFull(serverName, serverPath, init, accept.ServerEphPK, accept.Cipher)
 	if err != nil {
 		return 0, V3SessionKeys{}, 0, fmt.Errorf("计算 transcript hash 失败: %w", err)
 	}
-	keys, err := deriveV3SessionKeys(token, th)
+	keys, err := deriveV3SessionSeed(token, thFull, shared)
 	if err != nil {
 		return 0, V3SessionKeys{}, 0, fmt.Errorf("派生会话密钥失败: %w", err)
 	}
@@ -327,6 +376,44 @@ func clientSessionIDBytes(clientID string) ([]byte, error) {
 		return nil, fmt.Errorf("client id invalid: %w", err)
 	}
 	return id[:], nil
+}
+
+// sampleFirstPacketTarget samples a target length for the ChannelInit first packet according to 3 confidence bands:
+// Band A: [480, 576] (50% weight)
+// Band B: [1024, 1152] (25% weight)
+// Band C: [1280, 1400] (25% weight)
+// If frameLen >= 1400 or the sampled target < frameLen, it returns ok=false.
+func sampleFirstPacketTarget(frameLen int) (target int, ok bool) {
+	if frameLen >= 1400 {
+		return 0, false
+	}
+
+	w, err := rand.Int(rand.Reader, big.NewInt(100))
+	if err != nil {
+		return 0, false
+	}
+	weight := w.Int64()
+
+	var min, max int
+	if weight < 50 {
+		min, max = 480, 576
+	} else if weight < 75 {
+		min, max = 1024, 1152
+	} else {
+		min, max = 1280, 1400
+	}
+
+	bandRange := int64(max - min + 1)
+	offset, err := rand.Int(rand.Reader, big.NewInt(bandRange))
+	if err != nil {
+		return 0, false
+	}
+	target = min + int(offset.Int64())
+
+	if target < frameLen {
+		return target, false
+	}
+	return target, true
 }
 
 func protocolAuthEndpoint(raw string) (string, string, error) {

@@ -158,7 +158,7 @@ func TestLocalTunnelIntegration(t *testing.T) {
 		"-n", "1",
 	)
 	defer stopProcess(badClient)
-	waitLogContains(t, ctx, badClientLog, "认证失败", badClient)
+	waitLogContains(t, ctx, badClientLog, "协议协商失败", badClient)
 	waitLogContains(t, ctx, serverLog, "v3 认证失败", server)
 	assertMetricValue(t, fetchHTTP(t, "http://"+metricsAddr+"/metrics"), "x_tunnel_server_auth_rejections_total", "1")
 }

@@ -93,6 +93,8 @@ type CounterStats struct {
 	ServerProtocolNegotiationRejections uint64 `json:"server_protocol_negotiation_rejections_total"`
 	ServerProtocolNegotiationFailures   uint64 `json:"server_protocol_negotiation_failures_total"`
 	ServerProtocolReplayRejections      uint64 `json:"server_protocol_replay_rejections_total"`
+	ServerTAI64NRejections              uint64 `json:"server_tai64n_rejections_total"`
+	ServerTAI64NLRUEvictions            uint64 `json:"server_tai64n_lru_evictions_total"`
 	ClientProtocolNegotiations          uint64 `json:"client_protocol_negotiations_total"`
 	ClientProtocolNegotiationFailures   uint64 `json:"client_protocol_negotiation_failures_total"`
 	ClientRTTProbeFailures              uint64 `json:"client_rtt_probe_failures_total"`
@@ -234,6 +236,8 @@ func (e *Engine) Stats() Stats {
 			ServerProtocolNegotiationRejections: atomic.LoadUint64(&serverProtocolRejectSeq),
 			ServerProtocolNegotiationFailures:   atomic.LoadUint64(&serverProtocolFailureSeq),
 			ServerProtocolReplayRejections:      atomic.LoadUint64(&serverProtocolReplaySeq),
+			ServerTAI64NRejections:              atomic.LoadUint64(&serverTAI64NRejectSeq),
+			ServerTAI64NLRUEvictions:            atomic.LoadUint64(&serverTAI64NEvictSeq),
 			ClientProtocolNegotiations:          atomic.LoadUint64(&clientProtocolOKSeq),
 			ClientProtocolNegotiationFailures:   atomic.LoadUint64(&clientProtocolFailureSeq),
 			ClientRTTProbeFailures:              atomic.LoadUint64(&clientRTTProbeFailureSeq),

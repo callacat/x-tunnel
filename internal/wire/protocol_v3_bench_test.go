@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"io"
 	"testing"
+
+	"golang.org/x/crypto/curve25519"
 )
 
 // discardRWC implements io.ReadWriteCloser by discarding all writes.
@@ -22,16 +24,18 @@ type repeatingRecordReader struct {
 
 func (r *repeatingRecordReader) Read(p []byte) (int, error) {
 	total := 0
-	for len(p) > 0 {
-		avail := len(r.record) - r.offset
-		if avail == 0 {
-			r.offset = 0
-			avail = len(r.record)
+	for total < len(p) {
+		remain := len(r.record) - r.offset
+		toCopy := len(p) - total
+		if toCopy > remain {
+			toCopy = remain
 		}
-		n := copy(p, r.record[r.offset:])
-		r.offset += n
-		p = p[n:]
-		total += n
+		copy(p[total:total+toCopy], r.record[r.offset:r.offset+toCopy])
+		total += toCopy
+		r.offset += toCopy
+		if r.offset >= len(r.record) {
+			r.offset = 0 // loop
+		}
 	}
 	return total, nil
 }
@@ -45,13 +49,14 @@ type nopCloserBuffer struct {
 
 func (n *nopCloserBuffer) Close() error { return nil }
 
-// BenchmarkV3DeriveSessionKeys benchmarks derivation of master seed and directional nonce prefixes.
+// BenchmarkV3DeriveSessionKeys benchmarks derivation of master seed and directional nonce prefixes with shared secret.
 func BenchmarkV3DeriveSessionKeys(b *testing.B) {
 	transcriptHash := sha256.Sum256([]byte("bench-transcript-sample"))
+	shared := bytes.Repeat([]byte{0x42}, 32)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		keys, err := DeriveV3SessionKeys("bench-token", transcriptHash[:])
+		keys, err := DeriveV3SessionSeed("bench-token", transcriptHash[:], shared)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -59,28 +64,51 @@ func BenchmarkV3DeriveSessionKeys(b *testing.B) {
 	}
 }
 
-// BenchmarkV3StreamKeyDerive benchmarks deriving a per-stream AEAD key.
-func BenchmarkV3StreamKeyDerive(b *testing.B) {
-	transcriptHash := sha256.Sum256([]byte("bench-transcript-sample"))
-	keys, err := DeriveV3SessionKeys("bench-token", transcriptHash[:])
-	if err != nil {
-		b.Fatal(err)
-	}
+// BenchmarkV3X25519 benchmarks X25519 ephemeral key generation and shared secret computation.
+func BenchmarkV3X25519(b *testing.B) {
+	sk1 := bytes.Repeat([]byte{0x01}, 32)
+	sk2 := bytes.Repeat([]byte{0x02}, 32)
+	pk2, _ := curve25519.X25519(sk2, curve25519.Basepoint)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key, err := keys.StreamKey(ProtocolCipherChaCha20Poly1305, true, 1, 0)
+		pk1, err := curve25519.X25519(sk1, curve25519.Basepoint)
 		if err != nil {
 			b.Fatal(err)
 		}
-		_ = key
+		shared, err := ComputeV3SharedSecret(sk1, pk2)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, _ = pk1, shared
 	}
 }
 
-// BenchmarkV3RecordSeal benchmarks framing and encrypting 1400B plaintext records.
+// BenchmarkV3StreamKeyDerive benchmarks deriving a per-stream AEAD key.
+func BenchmarkV3StreamKeyDerive(b *testing.B) {
+	transcriptHash := sha256.Sum256([]byte("bench-transcript-sample"))
+	shared := bytes.Repeat([]byte{0x42}, 32)
+	keys, err := DeriveV3SessionSeed("bench-token", transcriptHash[:], shared)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k, err := keys.StreamKey(ProtocolCipherChaCha20Poly1305, true, 1, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = k
+	}
+}
+
+// BenchmarkV3RecordSeal benchmarks framing, encryption, and authentication of 1400B records.
 func BenchmarkV3RecordSeal(b *testing.B) {
 	transcriptHash := sha256.Sum256([]byte("bench-transcript-sample"))
-	keys, err := DeriveV3SessionKeys("bench-token", transcriptHash[:])
+	shared := bytes.Repeat([]byte{0x42}, 32)
+	keys, err := DeriveV3SessionSeed("bench-token", transcriptHash[:], shared)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -118,10 +146,53 @@ func BenchmarkV3RecordSeal(b *testing.B) {
 	}
 }
 
+// BenchmarkV3RecordSealPadded benchmarks framing, uniform padding sampling, encryption, and authentication of smaller payloads padded to target sizes up to 1400B.
+func BenchmarkV3RecordSealPadded(b *testing.B) {
+	transcriptHash := sha256.Sum256([]byte("bench-transcript-sample"))
+	shared := bytes.Repeat([]byte{0x42}, 32)
+	keys, err := DeriveV3SessionSeed("bench-token", transcriptHash[:], shared)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	payload := bytes.Repeat([]byte("a"), 500)
+
+	cases := []struct {
+		name     string
+		cipherID byte
+	}{
+		{"ChaCha20Poly1305", ProtocolCipherChaCha20Poly1305},
+		{"AES256GCM", ProtocolCipherAES256GCM},
+		{"AES128GCM", ProtocolCipherAES128GCM},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			stream, err := NewV3CipherStream(discardRWC{}, keys, tc.cipherID, 1, true)
+			if err != nil {
+				b.Fatal(err)
+			}
+			stream.PadRecords = true
+			if _, err := stream.Write(payload); err != nil {
+				b.Fatal(err)
+			}
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := stream.Write(payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkV3RecordOpen benchmarks reading, parsing, and decrypting 1400B records.
 func BenchmarkV3RecordOpen(b *testing.B) {
 	transcriptHash := sha256.Sum256([]byte("bench-transcript-sample"))
-	keys, err := DeriveV3SessionKeys("bench-token", transcriptHash[:])
+	shared := bytes.Repeat([]byte{0x42}, 32)
+	keys, err := DeriveV3SessionSeed("bench-token", transcriptHash[:], shared)
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -239,9 +241,11 @@ func TestWriteMetrics(t *testing.T) {
 	atomic.StoreUint64(&clientProtocolOKSeq, 43)
 	atomic.StoreUint64(&clientProtocolFailureSeq, 53)
 	atomic.StoreUint64(&clientRTTProbeFailureSeq, 59)
+	atomic.StoreUint64(&serverTAI64NRejectSeq, 61)
+	atomic.StoreUint64(&serverTAI64NEvictSeq, 67)
 	serverSessions.Store("metrics-test", &ClientSession{
 		clientID:      "metrics-test",
-		channels:      map[uint64]*WSChannel{1: &WSChannel{id: 1}, 2: &WSChannel{id: 2}},
+		channels:      map[uint64]*WSChannel{1: {id: 1}, 2: {id: 2}},
 		activeStreams: 5,
 	})
 	_, clientSession := newProtocolNegotiationSmuxPair(t)
@@ -273,6 +277,8 @@ func TestWriteMetrics(t *testing.T) {
 		"x_tunnel_client_protocol_v2_success_total 43",
 		"x_tunnel_client_protocol_v2_failures_total 53",
 		"x_tunnel_client_rtt_probe_failures_total 59",
+		"x_tunnel_server_tai64n_rejections_total 61",
+		"x_tunnel_server_tai64n_lru_evictions_total 67",
 		"x_tunnel_server_sessions 1",
 		"x_tunnel_server_channels 2",
 		"x_tunnel_server_active_streams 5",
@@ -6162,12 +6168,25 @@ func TestNegotiateClientProtocolSuccess(t *testing.T) {
 			serverDone <- fmt.Errorf("auth proof did not verify")
 			return
 		}
+		serverSk, serverPk, err := newV3ClientEphemeralKey()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		_ = serverSk
+		serverProof, err := computeV3ServerProof(token, "example.com", "/tunnel", init, serverPk, protocolCipherChaCha20Poly1305)
+		if err != nil {
+			serverDone <- err
+			return
+		}
 		serverDone <- writeChannelAcceptV3(stream, ChannelAccept{
 			Capabilities: currentProtocolCapabilitiesV2(),
 			ServerNonce:  bytes.Repeat([]byte{0x22}, 32),
 			ServerTime:   init.Timestamp,
 			MaxFrameSize: maxV2FrameSize,
 			Cipher:       protocolCipherChaCha20Poly1305,
+			ServerEphPK:  serverPk,
+			ServerProof:  serverProof,
 		})
 	}()
 
@@ -6236,9 +6255,26 @@ func TestNegotiateClientProtocolErrors(t *testing.T) {
 					ServerTime:   time.Now().Unix(),
 					MaxFrameSize: maxV2FrameSize,
 					Cipher:       protocolCipherChaCha20Poly1305,
+					ServerEphPK:  bytes.Repeat([]byte{0x44}, 32),
+					ServerProof:  bytes.Repeat([]byte{0x55}, 32),
 				})
 			},
 			wantErr: "协议能力不足",
+		},
+		{
+			name: "invalid server proof",
+			reply: func(w io.Writer) error {
+				return writeChannelAcceptV3(w, ChannelAccept{
+					Capabilities: currentProtocolCapabilitiesV2(),
+					ServerNonce:  bytes.Repeat([]byte{0x33}, 32),
+					ServerTime:   time.Now().Unix(),
+					MaxFrameSize: maxV2FrameSize,
+					Cipher:       protocolCipherChaCha20Poly1305,
+					ServerEphPK:  bytes.Repeat([]byte{0x44}, 32),
+					ServerProof:  bytes.Repeat([]byte{0xee}, 32),
+				})
+			},
+			wantErr: "服务端证明校验失败",
 		},
 	}
 
@@ -8334,15 +8370,20 @@ func TestPreAuthRejectsUnsupportedCipher(t *testing.T) {
 
 	sessionID := bytes.Repeat([]byte{0x11}, 16)
 	nonce := bytes.Repeat([]byte{0x22}, 32)
-	now := time.Now().Unix()
+	nowTime := time.Now()
+	now := nowTime.Unix()
+	tai64n := encodeTAI64N(nowTime)
+	_, clientPk, _ := newV3ClientEphemeralKey()
 
 	init := ChannelInit{
 		SessionID:    sessionID,
 		ChannelID:    1,
 		ClientNonce:  nonce,
 		Timestamp:    now,
-		Capabilities: currentProtocolCapabilitiesV2(),
-		CipherPref:   []byte{99, 1},
+		Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
+		CipherPref:   defaultCipherPreference,
+		ClientEphPK:  clientPk,
+		TAI64N:       tai64n,
 	}
 	proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
 	if err != nil {
@@ -8359,24 +8400,31 @@ func TestPreAuthRejectsUnsupportedCipher(t *testing.T) {
 	binary.BigEndian.PutUint64(timeBytes[:], uint64(now))
 	writeTestTLV(&body, 0x8004, timeBytes[:])
 	var capsBytes [8]byte
-	binary.BigEndian.PutUint64(capsBytes[:], currentProtocolCapabilitiesV2())
+	binary.BigEndian.PutUint64(capsBytes[:], currentProtocolCapabilitiesV2()|protocolCapabilityForwardSecrecy)
 	writeTestTLV(&body, 0x8005, capsBytes[:])
 	writeTestTLV(&body, 0x8006, proof)
 	writeTestTLV(&body, 0x8030, []byte{99, 1})
+	writeTestTLV(&body, 0x8032, clientPk)
+	writeTestTLV(&body, 0x8035, tai64n)
 
-	if err := writeRawV3Frame(stream, 1, 3, body.Bytes()); err != nil {
-		t.Fatalf("writeRawV3Frame: %v", err)
+	var frame bytes.Buffer
+	frame.WriteByte(1)
+	frame.WriteByte(3)
+	var flags [2]byte
+	frame.Write(flags[:])
+	var bodyLen [4]byte
+	binary.BigEndian.PutUint32(bodyLen[:], uint32(body.Len()))
+	frame.Write(bodyLen[:])
+	frame.Write(body.Bytes())
+
+	if _, err := stream.Write(frame.Bytes()); err != nil {
+		t.Fatalf("stream.Write: %v", err)
 	}
 
-	_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
-	if err != nil {
-		t.Fatalf("readChannelAcceptOrRejectV3: %v", err)
-	}
-	if reject.Code == 0 {
-		t.Fatal("expected reject code, got accept")
-	}
-	if reject.Code != v2RejectMalformedFrame && reject.Code != v3RejectUnsupportedCipher {
-		t.Fatalf("reject.Code = %d, want MalformedFrame or UnsupportedCipher", reject.Code)
+	_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
+	accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+	if err == nil {
+		t.Fatalf("expected silent connection close, got accept=%+v, reject=%+v", accept, reject)
 	}
 }
 
@@ -8402,15 +8450,20 @@ func TestPreAuthRejectsTamperedAuthProof(t *testing.T) {
 
 	sessionID := bytes.Repeat([]byte{0x33}, 16)
 	nonce := bytes.Repeat([]byte{0x44}, 32)
-	now := time.Now().Unix()
+	nowTime := time.Now()
+	now := nowTime.Unix()
+	tai64n := encodeTAI64N(nowTime)
+	_, clientPk, _ := newV3ClientEphemeralKey()
 
 	init := ChannelInit{
 		SessionID:    sessionID,
 		ChannelID:    1,
 		ClientNonce:  nonce,
 		Timestamp:    now,
-		Capabilities: currentProtocolCapabilitiesV2(),
+		Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
 		CipherPref:   defaultCipherPreference,
+		ClientEphPK:  clientPk,
+		TAI64N:       tai64n,
 	}
 	proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
 	if err != nil {
@@ -8423,12 +8476,10 @@ func TestPreAuthRejectsTamperedAuthProof(t *testing.T) {
 		t.Fatalf("writeChannelInitV3: %v", err)
 	}
 
-	_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
-	if err != nil {
-		t.Fatalf("readChannelAcceptOrRejectV3: %v", err)
-	}
-	if reject.Code != v2RejectAuthenticationFailed {
-		t.Fatalf("reject.Code = %d, want AuthenticationFailed (%d)", reject.Code, v2RejectAuthenticationFailed)
+	_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
+	accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+	if err == nil {
+		t.Fatalf("expected silent connection close, got accept=%+v, reject=%+v", accept, reject)
 	}
 }
 
@@ -8461,7 +8512,7 @@ func TestPreAuthRejectsV2Frame(t *testing.T) {
 		ChannelID:    1,
 		ClientNonce:  nonce,
 		Timestamp:    now,
-		Capabilities: currentProtocolCapabilitiesV2(),
+		Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
 	}
 	proof, err := computeV2AuthProof(token, "example.com", "/tunnel", init)
 	if err != nil {
@@ -8469,16 +8520,71 @@ func TestPreAuthRejectsV2Frame(t *testing.T) {
 	}
 	init.AuthProof = proof
 
+	// Write v2 frame using v2 encoder (frame type 1, version 2)
 	if err := writeChannelInit(stream, init); err != nil {
 		t.Fatalf("writeChannelInit: %v", err)
 	}
 
-	_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
-	if err != nil {
-		t.Fatalf("readChannelAcceptOrRejectV3: %v", err)
+	_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
+	accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+	if err == nil {
+		t.Fatalf("expected silent connection close, got accept=%+v, reject=%+v", accept, reject)
 	}
-	if reject.Code != v2RejectMalformedFrame {
-		t.Fatalf("reject.Code = %d, want MalformedFrame (%d)", reject.Code, v2RejectMalformedFrame)
+}
+
+func TestPreAuthRejectsMissingForwardSecrecyCapability(t *testing.T) {
+	oldToken := token
+	t.Cleanup(func() { token = oldToken })
+	token = "v3-missing-fs-token"
+
+	clientConn, serverConn := newTestWSNetConnPair(t)
+	go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
+
+	clientSess, err := smux.Client(clientConn, nil)
+	if err != nil {
+		t.Fatalf("smux.Client: %v", err)
+	}
+	defer clientSess.Close()
+
+	stream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("clientSess.OpenStream: %v", err)
+	}
+	defer stream.Close()
+
+	sessionID := bytes.Repeat([]byte{0xaa}, 16)
+	nonce := bytes.Repeat([]byte{0xbb}, 32)
+	nowTime := time.Now()
+	now := nowTime.Unix()
+	tai64n := encodeTAI64N(nowTime)
+	_, clientPk, _ := newV3ClientEphemeralKey()
+
+	// Caps without ForwardSecrecy bit (P0 style client)
+	p0Caps := currentProtocolCapabilitiesV2() &^ protocolCapabilityForwardSecrecy
+	init := ChannelInit{
+		SessionID:    sessionID,
+		ChannelID:    1,
+		ClientNonce:  nonce,
+		Timestamp:    now,
+		Capabilities: p0Caps,
+		CipherPref:   defaultCipherPreference,
+		ClientEphPK:  clientPk,
+		TAI64N:       tai64n,
+	}
+	proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
+	if err != nil {
+		t.Fatalf("computeV3AuthProof: %v", err)
+	}
+	init.AuthProof = proof
+
+	if err := writeChannelInitV3(stream, init); err != nil {
+		t.Fatalf("writeChannelInitV3: %v", err)
+	}
+
+	_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
+	accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+	if err == nil {
+		t.Fatalf("expected silent connection close, got accept=%+v, reject=%+v", accept, reject)
 	}
 }
 
@@ -8489,15 +8595,20 @@ func TestPreAuthRejectsReplay(t *testing.T) {
 
 	sessionID := bytes.Repeat([]byte{0x77}, 16)
 	nonce := bytes.Repeat([]byte{0x88}, 32)
-	now := time.Now().Unix()
+	nowTime := time.Now()
+	now := nowTime.Unix()
+	tai64n := encodeTAI64N(nowTime)
+	_, clientPk, _ := newV3ClientEphemeralKey()
 
 	init := ChannelInit{
 		SessionID:    sessionID,
 		ChannelID:    1,
 		ClientNonce:  nonce,
 		Timestamp:    now,
-		Capabilities: currentProtocolCapabilitiesV2(),
+		Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
 		CipherPref:   defaultCipherPreference,
+		ClientEphPK:  clientPk,
+		TAI64N:       tai64n,
 	}
 	proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
 	if err != nil {
@@ -8526,19 +8637,20 @@ func TestPreAuthRejectsReplay(t *testing.T) {
 			t.Fatalf("writeChannelInitV3 1: %v", err)
 		}
 
+		_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
 		accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
 		if err != nil {
 			t.Fatalf("readChannelAcceptOrRejectV3 1: %v", err)
 		}
 		if reject.Code != 0 {
-			t.Fatalf("first connection rejected: %d %s", reject.Code, reject.Message)
+			t.Fatalf("unexpected reject code 1: %d", reject.Code)
 		}
 		if accept.Cipher != protocolCipherChaCha20Poly1305 {
 			t.Fatalf("accept.Cipher = %d, want %d", accept.Cipher, protocolCipherChaCha20Poly1305)
 		}
 	}
 
-	// Second connection with same ChannelInit: must be rejected with ReplayDetected
+	// Second connection with exact same ChannelInit: must be rejected silently (nonce / TAI64N replay)
 	{
 		clientConn, serverConn := newTestWSNetConnPair(t)
 		go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
@@ -8559,12 +8671,222 @@ func TestPreAuthRejectsReplay(t *testing.T) {
 			t.Fatalf("writeChannelInitV3 2: %v", err)
 		}
 
-		_, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+		_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
+		accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+		if err == nil {
+			t.Fatalf("expected silent connection close on replay, got accept=%+v, reject=%+v", accept, reject)
+		}
+	}
+}
+
+func TestPreAuthTAI64NMonotonicAntiReplay(t *testing.T) {
+	oldToken := token
+	t.Cleanup(func() { token = oldToken })
+	token = "v3-tai64n-monotonic-token"
+
+	sessionIDA := bytes.Repeat([]byte{0xa1}, 16)
+	sessionIDB := bytes.Repeat([]byte{0xb2}, 16)
+
+	t1 := time.Now().Truncate(time.Second)
+	t2 := t1.Add(10 * time.Millisecond)
+	t3Equal := t2
+	t4Older := t1.Add(-5 * time.Second)
+	t5Newer := t1.Add(20 * time.Millisecond)
+
+	connectWith := func(sessionID []byte, channelID uint32, tm time.Time) error {
+		clientConn, serverConn := newTestWSNetConnPair(t)
+		go handlePreAuthWebSocketChannel(serverConn.ws, "127.0.0.1", "example.com", "/tunnel")
+
+		clientSess, err := smux.Client(clientConn, nil)
 		if err != nil {
-			t.Fatalf("readChannelAcceptOrRejectV3 2: %v", err)
+			return err
 		}
-		if reject.Code != v2RejectReplayDetected {
-			t.Fatalf("reject.Code = %d, want ReplayDetected (%d)", reject.Code, v2RejectReplayDetected)
+		defer clientSess.Close()
+
+		stream, err := clientSess.OpenStream()
+		if err != nil {
+			return err
 		}
+		defer stream.Close()
+
+		nonce := make([]byte, 32)
+		_, _ = rand.Read(nonce)
+		_, clientPk, _ := newV3ClientEphemeralKey()
+
+		init := ChannelInit{
+			SessionID:    sessionID,
+			ChannelID:    channelID,
+			ClientNonce:  nonce,
+			Timestamp:    tm.Unix(),
+			Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
+			CipherPref:   defaultCipherPreference,
+			ClientEphPK:  clientPk,
+			TAI64N:       encodeTAI64N(tm),
+		}
+		proof, err := computeV3AuthProof(token, "example.com", "/tunnel", init)
+		if err != nil {
+			return err
+		}
+		init.AuthProof = proof
+
+		if err := writeChannelInitV3(stream, init); err != nil {
+			return err
+		}
+
+		_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
+		accept, reject, err := readChannelAcceptOrRejectV3(stream, maxV2FrameSize)
+		if err != nil {
+			return err
+		}
+		if reject.Code != 0 {
+			return fmt.Errorf("rejected with code %d", reject.Code)
+		}
+		if accept.Cipher == 0 {
+			return fmt.Errorf("empty cipher in accept")
+		}
+		return nil
+	}
+
+	// 1. Session A with T1 -> should succeed
+	if err := connectWith(sessionIDA, 1, t1); err != nil {
+		t.Fatalf("Session A at T1 failed: %v", err)
+	}
+
+	// 2. Session A with T2 (> T1) -> should succeed
+	if err := connectWith(sessionIDA, 2, t2); err != nil {
+		t.Fatalf("Session A at T2 failed: %v", err)
+	}
+
+	// 3. Session A with T3 (= T2) -> must be rejected silently
+	if err := connectWith(sessionIDA, 3, t3Equal); err == nil {
+		t.Fatalf("Session A at T3 (= T2) should have been rejected silently")
+	}
+
+	// 4. Session A with T4 (< T2) -> must be rejected silently
+	if err := connectWith(sessionIDA, 4, t4Older); err == nil {
+		t.Fatalf("Session A at T4 (< T2) should have been rejected silently")
+	}
+
+	// 5. Session B (different identity) with T1 (same as Session A's first timestamp) -> should succeed
+	if err := connectWith(sessionIDB, 1, t1); err != nil {
+		t.Fatalf("Session B at T1 failed: %v", err)
+	}
+
+	// 6. Session A with T5 (> T2) -> should succeed
+	if err := connectWith(sessionIDA, 5, t5Newer); err != nil {
+		t.Fatalf("Session A at T5 failed: %v", err)
+	}
+}
+
+func TestTAI64NCacheLRU(t *testing.T) {
+	cache := newTAI64NCache(2)
+	s1 := []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	s2 := []byte{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2}
+	s3 := []byte{3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3}
+
+	t10 := encodeTAI64N(time.Unix(10, 0).UTC())
+	t20 := encodeTAI64N(time.Unix(20, 0).UTC())
+	t5 := encodeTAI64N(time.Unix(5, 0).UTC())
+
+	// Insert s1 at t10 -> OK
+	if !cache.CheckAndStore(s1, t10) {
+		t.Fatal("s1 t10 should be accepted")
+	}
+	// Insert s2 at t10 -> OK
+	if !cache.CheckAndStore(s2, t10) {
+		t.Fatal("s2 t10 should be accepted")
+	}
+	if cache.Len() != 2 {
+		t.Fatalf("cache len = %d, want 2", cache.Len())
+	}
+
+	// Insert s3 at t10 -> s1 (least recently used) is evicted, s3 inserted
+	if !cache.CheckAndStore(s3, t10) {
+		t.Fatal("s3 t10 should be accepted")
+	}
+	if cache.Len() != 2 {
+		t.Fatalf("cache len = %d, want 2", cache.Len())
+	}
+
+	// s2 is still in cache: connecting with t5 (< t10) should fail
+	if cache.CheckAndStore(s2, t5) {
+		t.Fatal("s2 t5 should be rejected as non-monotonic")
+	}
+	// s2 connecting with t20 (> t10) should succeed and move s2 to front
+	if !cache.CheckAndStore(s2, t20) {
+		t.Fatal("s2 t20 should be accepted")
+	}
+
+	// s1 was evicted, so inserting s1 with t5 (< t10) is accepted as a new session
+	if !cache.CheckAndStore(s1, t5) {
+		t.Fatal("evicted s1 at t5 should be accepted as new session")
+	}
+}
+
+func TestTAI64NCacheConcurrent(t *testing.T) {
+	cache := newTAI64NCache(100)
+	var wg sync.WaitGroup
+	const goroutines = 16
+	const iterations = 100
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			var sKey [16]byte
+			sKey[0] = byte(id)
+			for j := 0; j < iterations; j++ {
+				tm := time.Unix(int64(j+1), 0).UTC()
+				tBytes := encodeTAI64N(tm)
+				_ = cache.CheckAndStore(sKey[:], tBytes)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestSampleFirstPacketTarget(t *testing.T) {
+	// 1. frameLen >= 1400 must return ok=false
+	for _, l := range []int{1400, 1401, 2000} {
+		if _, ok := sampleFirstPacketTarget(l); ok {
+			t.Fatalf("sampleFirstPacketTarget(%d) expected ok=false, got true", l)
+		}
+	}
+
+	// 2. 1000 samples for normal frameLen (e.g. 200)
+	const trials = 1000
+	var countA, countB, countC int
+
+	for i := 0; i < trials; i++ {
+		target, ok := sampleFirstPacketTarget(200)
+		if !ok {
+			t.Fatalf("sampleFirstPacketTarget(200) returned ok=false on trial %d", i)
+		}
+		if target >= 480 && target <= 576 {
+			countA++
+		} else if target >= 1024 && target <= 1152 {
+			countB++
+		} else if target >= 1280 && target <= 1400 {
+			countC++
+		} else {
+			t.Fatalf("target %d not in any expected confidence band", target)
+		}
+	}
+
+	if countA+countB+countC != trials {
+		t.Fatalf("total count %d != %d", countA+countB+countC, trials)
+	}
+
+	// Band A: ~50% (assert 350..650)
+	// Band B: ~25% (assert 150..350)
+	// Band C: ~25% (assert 150..350)
+	if countA < 350 || countA > 650 {
+		t.Fatalf("Band A count %d out of expected range [350, 650]", countA)
+	}
+	if countB < 150 || countB > 350 {
+		t.Fatalf("Band B count %d out of expected range [150, 350]", countB)
+	}
+	if countC < 150 || countC > 350 {
+		t.Fatalf("Band C count %d out of expected range [150, 350]", countC)
 	}
 }

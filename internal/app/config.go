@@ -183,6 +183,8 @@ var (
 	serverProtocolRejectSeq    uint64
 	serverProtocolFailureSeq   uint64
 	serverProtocolReplaySeq    uint64
+	serverTAI64NRejectSeq      uint64
+	serverTAI64NEvictSeq       uint64
 	clientProtocolOKSeq        uint64
 	clientProtocolFailureSeq   uint64
 	clientRTTProbeFailureSeq   uint64

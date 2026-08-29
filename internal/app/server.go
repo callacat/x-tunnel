@@ -28,9 +28,10 @@ import (
 )
 
 var (
-	serverSessionsMu sync.Mutex
-	serverSessions   sync.Map // map[string]*ClientSession
-	serverNonceCache = newNonceReplayCache(65536)
+	serverSessionsMu  sync.Mutex
+	serverSessions    sync.Map // map[string]*ClientSession
+	serverNonceCache  = newNonceReplayCache(65536)
+	serverTAI64NCache = newTAI64NCache(defaultTAI64NCacheCapacity)
 )
 
 type nonceReplayCache struct {
@@ -413,6 +414,10 @@ func writeMetrics(w io.Writer) {
 	fmt.Fprintf(w, "x_tunnel_server_protocol_v2_replay_rejections_total %d\n", atomic.LoadUint64(&serverProtocolReplaySeq))
 	fmt.Fprintf(w, "# TYPE x_tunnel_server_protocol_v2_auth_failures_total counter\n")
 	fmt.Fprintf(w, "x_tunnel_server_protocol_v2_auth_failures_total %d\n", atomic.LoadUint64(&serverAuthRejectSeq))
+	fmt.Fprintf(w, "# TYPE x_tunnel_server_tai64n_rejections_total counter\n")
+	fmt.Fprintf(w, "x_tunnel_server_tai64n_rejections_total %d\n", atomic.LoadUint64(&serverTAI64NRejectSeq))
+	fmt.Fprintf(w, "# TYPE x_tunnel_server_tai64n_lru_evictions_total counter\n")
+	fmt.Fprintf(w, "x_tunnel_server_tai64n_lru_evictions_total %d\n", atomic.LoadUint64(&serverTAI64NEvictSeq))
 	fmt.Fprintf(w, "# TYPE x_tunnel_client_protocol_negotiations_total counter\n")
 	fmt.Fprintf(w, "x_tunnel_client_protocol_negotiations_total %d\n", atomic.LoadUint64(&clientProtocolOKSeq))
 	fmt.Fprintf(w, "# TYPE x_tunnel_client_protocol_negotiation_failures_total counter\n")
@@ -671,23 +676,32 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	init, err := readChannelInitV3(stream, maxV2FrameSize)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectMalformedFrame, Message: "malformed ChannelInit"})
 		_ = wsConn.Close()
 		log.Printf("[服务端] v3 ChannelInit 读取失败: %v", err)
+		return
+	}
+	if _, err := decodeTAI64N(init.TAI64N); err != nil {
+		atomic.AddUint64(&serverProtocolRejectSeq, 1)
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 ChannelInit TAI64N 格式非法: %v 来源 IP: %s", err, clientIP)
 		return
 	}
 	now := time.Now()
 	if !validateChannelInitTime(now, init.Timestamp, cfg.AuthSkew) {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectTimestampSkew, Message: "timestamp skew"})
 		_ = wsConn.Close()
 		log.Printf("[服务端] v3 ChannelInit 时间戳拒绝，来源 IP: %s", clientIP)
+		return
+	}
+	if len(init.ClientEphPK) != 32 {
+		atomic.AddUint64(&serverProtocolFailureSeq, 1)
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 ChannelInit 客户端公钥长度非法，来源 IP: %s", clientIP)
 		return
 	}
 	if !verifyV3AuthProof(token, serverName, path, init) {
 		atomic.AddUint64(&serverAuthRejectSeq, 1)
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectAuthenticationFailed, Message: "auth proof invalid"})
 		_ = wsConn.Close()
 		log.Printf("[服务端] v3 认证失败，来源 IP: %s", clientIP)
 		return
@@ -695,48 +709,82 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	if serverNonceCache.seenOrStore(init.SessionID, init.ChannelID, init.ClientNonce, now, cfg.AuthSkew) {
 		atomic.AddUint64(&serverProtocolReplaySeq, 1)
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectReplayDetected, Message: "nonce replay"})
 		_ = wsConn.Close()
 		log.Printf("[服务端] v3 ChannelInit nonce 重放，来源 IP: %s", clientIP)
 		return
 	}
-	caps, rejectCode, rejectMessage := negotiateProtocolCapabilitiesV2(init.Capabilities)
+	if !serverTAI64NCache.CheckAndStore(init.SessionID, init.TAI64N) {
+		atomic.AddUint64(&serverTAI64NRejectSeq, 1)
+		atomic.AddUint64(&serverProtocolRejectSeq, 1)
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 ChannelInit TAI64N 重放或非单调递增，来源 IP: %s", clientIP)
+		return
+	}
+	required := requiredProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy
+	if init.Capabilities&required != required {
+		atomic.AddUint64(&serverProtocolRejectSeq, 1)
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 ChannelInit 缺少必需能力 (got 0x%x, want 0x%x)，来源 IP: %s", init.Capabilities, required, clientIP)
+		return
+	}
+	caps := init.Capabilities & currentProtocolCapabilitiesV2()
+	chosenCipher, rejectCode, msg := negotiateCipherV3(init.CipherPref)
 	if rejectCode != 0 {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: rejectCode, Message: rejectMessage})
 		_ = wsConn.Close()
-		log.Printf("[服务端] v3 协议能力拒绝: %s", rejectMessage)
+		log.Printf("[服务端] v3 加密算法协商失败: %s IP: %s", msg, clientIP)
 		return
 	}
-	chosenCipher, cipherRejectCode, cipherRejectMsg := negotiateCipherV3(init.CipherPref)
-	if cipherRejectCode != 0 {
-		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: cipherRejectCode, Message: cipherRejectMsg})
-		_ = wsConn.Close()
-		log.Printf("[服务端] v3 加密套件拒绝: %s", cipherRejectMsg)
-		return
-	}
+
 	sessionID := hex.EncodeToString(init.SessionID)
 	session, ok := getOrCreateClientSession(sessionID)
 	if !ok {
 		atomic.AddUint64(&serverClientRejectSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectResourceLimit, Message: "max clients reached"})
 		_ = wsConn.Close()
 		log.Printf("[服务端] 拒绝 v3 客户端会话: session=%s max-clients=%d", shortID(sessionID), maxClientSessions)
 		return
 	}
-	th, err := computeV3TranscriptHash(serverName, path, init)
+
+	serverSk, serverPk, err := newV3ClientEphemeralKey()
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectMalformedFrame, Message: "transcript hash failed"})
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 生成 ephemeral 密钥失败: %v", err)
+		return
+	}
+	defer func() {
+		for i := range serverSk {
+			serverSk[i] = 0
+		}
+	}()
+
+	shared, err := computeV3SharedSecret(serverSk, init.ClientEphPK)
+	if err != nil {
+		atomic.AddUint64(&serverProtocolFailureSeq, 1)
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 计算共享秘密失败: %v", err)
+		return
+	}
+
+	thFull, err := computeV3TranscriptHashFull(serverName, path, init, serverPk, chosenCipher)
+	if err != nil {
+		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		_ = wsConn.Close()
 		log.Printf("[服务端] v3 计算 transcript hash 失败: %v", err)
 		return
 	}
-	keys, err := deriveV3SessionKeys(token, th)
+
+	serverProof, err := computeV3ServerProof(token, serverName, path, init, serverPk, chosenCipher)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = writeChannelRejectV3(stream, ChannelReject{Code: v2RejectMalformedFrame, Message: "kdf failed"})
+		_ = wsConn.Close()
+		log.Printf("[服务端] v3 计算 server proof 失败: %v", err)
+		return
+	}
+
+	keys, err := deriveV3SessionSeed(token, thFull, shared)
+	if err != nil {
+		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		_ = wsConn.Close()
 		log.Printf("[服务端] v3 派生会话密钥失败: %v", err)
 		return
@@ -751,7 +799,7 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		session.removeChannel(ch.id, ch)
 		_ = wsConn.Close()
-		log.Printf("[服务端] v3 server nonce 生成失败: %v", err)
+		log.Printf("[服务端] v3 生成服务端 nonce 失败: %v", err)
 		return
 	}
 	accept := ChannelAccept{
@@ -760,6 +808,8 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 		ServerTime:   now.Unix(),
 		MaxFrameSize: maxV2FrameSize,
 		Cipher:       chosenCipher,
+		ServerEphPK:  serverPk,
+		ServerProof:  serverProof,
 	}
 	if maxStreamsPerClient > 0 {
 		accept.MaxStreams = uint32(maxStreamsPerClient)
@@ -777,7 +827,6 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	_ = netConn.SetDeadline(time.Time{})
 	handleAuthenticatedSmuxSession(ch, sess)
 }
-
 func validateChannelInitTime(now time.Time, timestamp int64, skew time.Duration) bool {
 	if skew <= 0 {
 		return true

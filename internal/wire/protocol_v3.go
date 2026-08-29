@@ -2,11 +2,14 @@ package wire
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
+	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -19,8 +22,12 @@ const (
 )
 
 const (
-	v3RecordCipherPref uint16 = 0x8030
-	v3RecordCipher     uint16 = 0x8031
+	v3RecordCipherPref  uint16 = 0x8030
+	v3RecordCipher      uint16 = 0x8031
+	v3RecordClientEphPK uint16 = 0x8032
+	v3RecordServerEphPK uint16 = 0x8033
+	v3RecordServerProof uint16 = 0x8034
+	v3RecordTAI64N      uint16 = 0x8035
 )
 
 const (
@@ -36,6 +43,13 @@ const (
 const (
 	ProtocolV3Version         = protocolV3Version
 	V3RejectUnsupportedCipher = v3RejectUnsupportedCipher
+
+	V3RecordCipherPref  = v3RecordCipherPref
+	V3RecordCipher      = v3RecordCipher
+	V3RecordClientEphPK = v3RecordClientEphPK
+	V3RecordServerEphPK = v3RecordServerEphPK
+	V3RecordServerProof = v3RecordServerProof
+	V3RecordTAI64N      = v3RecordTAI64N
 )
 
 func isSupportedCipherV3(id byte) bool {
@@ -98,6 +112,42 @@ func NegotiateCipherV3(pref []byte) (chosen byte, rejectCode byte, msg string) {
 	return 0, v3RejectUnsupportedCipher, "no supported cipher in preference"
 }
 
+// NewV3ClientEphemeralKey generates a new ephemeral X25519 private/public keypair.
+func NewV3ClientEphemeralKey() (ephSk, ephPk []byte, err error) {
+	ephSk = make([]byte, 32)
+	if _, err := rand.Read(ephSk); err != nil {
+		return nil, nil, err
+	}
+	ephPk, err = curve25519.X25519(ephSk, curve25519.Basepoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ephSk, ephPk, nil
+}
+
+// ComputeV3SharedSecret computes the X25519 Diffie-Hellman shared secret between private key ephSk and peer public key peerPk.
+// Outputs that are all zeros (such as from RFC 7748 low-order points) are rejected.
+func ComputeV3SharedSecret(ephSk, peerPk []byte) ([]byte, error) {
+	if len(ephSk) != 32 {
+		return nil, fmt.Errorf("ephemeral secret key must be 32 bytes")
+	}
+	if len(peerPk) != 32 {
+		return nil, fmt.Errorf("peer public key must be 32 bytes")
+	}
+	shared, err := curve25519.X25519(ephSk, peerPk)
+	if err != nil {
+		return nil, fmt.Errorf("x25519 computation failed: %w", err)
+	}
+	var allZero byte
+	for _, b := range shared {
+		allZero |= b
+	}
+	if allZero == 0 {
+		return nil, errors.New("computed shared secret is all zeros (low-order point)")
+	}
+	return shared, nil
+}
+
 // V3Frame represents a protocol v3 framing envelope.
 type V3Frame struct {
 	Type    byte
@@ -131,8 +181,8 @@ func readV3Frame(r io.Reader, maxSize int) (V3Frame, error) {
 	if maxSize <= 0 {
 		maxSize = maxV2FrameSize
 	}
-	head := make([]byte, 8)
-	if _, err := io.ReadFull(r, head); err != nil {
+	var head [8]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
 		return V3Frame{}, err
 	}
 	frame := V3Frame{
@@ -147,11 +197,12 @@ func readV3Frame(r io.Reader, maxSize int) (V3Frame, error) {
 	if bodyLen > maxSize {
 		return V3Frame{}, fmt.Errorf("v3 frame body too large: %d", bodyLen)
 	}
-	body, err := readExactPayload(r, bodyLen)
-	if err != nil {
-		return V3Frame{}, err
+	if bodyLen > 0 {
+		frame.Body = make([]byte, bodyLen)
+		if _, err := io.ReadFull(r, frame.Body); err != nil {
+			return V3Frame{}, err
+		}
 	}
-	frame.Body = body
 	return frame, nil
 }
 
@@ -195,6 +246,12 @@ func encodeChannelInitV3(init ChannelInit) ([]byte, error) {
 			return nil, fmt.Errorf("unsupported cipher in preference: %d", c)
 		}
 	}
+	if len(init.ClientEphPK) != 32 {
+		return nil, fmt.Errorf("client ephemeral public key must be 32 bytes")
+	}
+	if len(init.TAI64N) != 12 {
+		return nil, fmt.Errorf("tai64n timestamp must be 12 bytes")
+	}
 
 	var channelIDBytes [4]byte
 	binary.BigEndian.PutUint32(channelIDBytes[:], init.ChannelID)
@@ -211,6 +268,11 @@ func encodeChannelInitV3(init ChannelInit) ([]byte, error) {
 		{Type: v2RecordCapabilities, Value: capsBytes[:]},
 		{Type: v2RecordAuthProof, Value: init.AuthProof},
 		{Type: v3RecordCipherPref, Value: init.CipherPref},
+		{Type: v3RecordClientEphPK, Value: init.ClientEphPK},
+		{Type: v3RecordTAI64N, Value: init.TAI64N},
+	}
+	if len(init.Padding) > 0 {
+		records = append(records, V2TLV{Type: v2RecordPadding, Value: init.Padding})
 	}
 	return encodeV2TLVs(records)
 }
@@ -229,6 +291,8 @@ func decodeChannelInitV3(body []byte) (ChannelInit, error) {
 		v2RecordTransportHints:      true,
 		v2RecordPadding:             true,
 		v3RecordCipherPref:          true,
+		v3RecordClientEphPK:         true,
+		v3RecordTAI64N:              true,
 	}
 	records, err := parseV2TLVs(body, known)
 	if err != nil {
@@ -282,13 +346,21 @@ func decodeChannelInitV3(body []byte) (ChannelInit, error) {
 			return ChannelInit{}, fmt.Errorf("unsupported cipher in preference: %d", c)
 		}
 	}
+	clientEphPK, err := get(v3RecordClientEphPK, 32)
+	if err != nil {
+		return ChannelInit{}, err
+	}
+	tai64n, err := get(v3RecordTAI64N, 12)
+	if err != nil {
+		return ChannelInit{}, err
+	}
 
 	channelID := binary.BigEndian.Uint32(channelIDRaw)
 	if channelID == 0 {
 		return ChannelInit{}, fmt.Errorf("channel id must be positive")
 	}
 
-	return ChannelInit{
+	res := ChannelInit{
 		SessionID:    append([]byte(nil), sessionID...),
 		ChannelID:    channelID,
 		ClientNonce:  append([]byte(nil), clientNonce...),
@@ -296,7 +368,13 @@ func decodeChannelInitV3(body []byte) (ChannelInit, error) {
 		Capabilities: binary.BigEndian.Uint64(capsRaw),
 		AuthProof:    append([]byte(nil), authProof...),
 		CipherPref:   append([]byte(nil), cipherPrefRaw...),
-	}, nil
+		ClientEphPK:  append([]byte(nil), clientEphPK...),
+		TAI64N:       append([]byte(nil), tai64n...),
+	}
+	if padRecord, ok := records[v2RecordPadding]; ok {
+		res.Padding = append([]byte(nil), padRecord.Value...)
+	}
+	return res, nil
 }
 
 func writeChannelAcceptV3(w io.Writer, accept ChannelAccept) error {
@@ -313,6 +391,12 @@ func encodeChannelAcceptV3(accept ChannelAccept) ([]byte, error) {
 	}
 	if !isSupportedCipherV3(accept.Cipher) {
 		return nil, fmt.Errorf("unsupported cipher in accept: %d", accept.Cipher)
+	}
+	if len(accept.ServerEphPK) != 32 {
+		return nil, fmt.Errorf("server ephemeral public key must be 32 bytes")
+	}
+	if len(accept.ServerProof) != 32 {
+		return nil, fmt.Errorf("server proof must be 32 bytes")
 	}
 
 	var capsBytes [8]byte
@@ -339,7 +423,11 @@ func encodeChannelAcceptV3(accept ChannelAccept) ([]byte, error) {
 	if len(accept.Message) > 0 {
 		records = append(records, V2TLV{Type: v2RecordMessage, Value: []byte(accept.Message)})
 	}
-	records = append(records, V2TLV{Type: v3RecordCipher, Value: []byte{accept.Cipher}})
+	records = append(records,
+		V2TLV{Type: v3RecordCipher, Value: []byte{accept.Cipher}},
+		V2TLV{Type: v3RecordServerEphPK, Value: accept.ServerEphPK},
+		V2TLV{Type: v3RecordServerProof, Value: accept.ServerProof},
+	)
 	return encodeV2TLVs(records)
 }
 
@@ -353,6 +441,8 @@ func decodeChannelAcceptV3(body []byte) (ChannelAccept, error) {
 		v2RecordMessage:      true,
 		v2RecordPadding:      true,
 		v3RecordCipher:       true,
+		v3RecordServerEphPK:  true,
+		v3RecordServerProof:  true,
 	}
 	records, err := parseV2TLVs(body, known)
 	if err != nil {
@@ -378,14 +468,23 @@ func decodeChannelAcceptV3(body []byte) (ChannelAccept, error) {
 	if !isSupportedCipherV3(cipherRecord.Value[0]) {
 		return ChannelAccept{}, fmt.Errorf("unsupported cipher in accept: %d", cipherRecord.Value[0])
 	}
+	serverEphPKRecord, ok := records[v3RecordServerEphPK]
+	if !ok || len(serverEphPKRecord.Value) != 32 {
+		return ChannelAccept{}, fmt.Errorf("invalid channel accept server ephemeral public key")
+	}
+	serverProofRecord, ok := records[v3RecordServerProof]
+	if !ok || len(serverProofRecord.Value) != 32 {
+		return ChannelAccept{}, fmt.Errorf("invalid channel accept server proof")
+	}
 
 	accept := ChannelAccept{
 		Capabilities: binary.BigEndian.Uint64(capsRecord.Value),
 		ServerNonce:  append([]byte(nil), serverNonceRecord.Value...),
 		ServerTime:   int64(binary.BigEndian.Uint64(serverTimeRecord.Value)),
 		Cipher:       cipherRecord.Value[0],
+		ServerEphPK:  append([]byte(nil), serverEphPKRecord.Value...),
+		ServerProof:  append([]byte(nil), serverProofRecord.Value...),
 	}
-
 	if maxFrameRecord, ok := records[v2RecordMaxFrameSize]; ok {
 		if len(maxFrameRecord.Value) != 4 {
 			return ChannelAccept{}, fmt.Errorf("invalid max frame size length")
@@ -429,42 +528,47 @@ func writeChannelRejectV3(w io.Writer, reject ChannelReject) error {
 	return writeV3Frame(w, V3Frame{Type: v3FrameTypeChannelReject, Version: protocolV3Version, Body: body})
 }
 
-// WriteV3Frame writes a v3 frame envelope to w.
+// WriteV3Frame writes a v3 framing envelope to w.
 func WriteV3Frame(w io.Writer, frame V3Frame) error {
 	return writeV3Frame(w, frame)
 }
 
-// ReadV3Frame reads a v3 frame envelope from r.
+// ReadV3Frame reads a v3 framing envelope from r.
 func ReadV3Frame(r io.Reader, maxSize int) (V3Frame, error) {
 	return readV3Frame(r, maxSize)
 }
 
-// WriteChannelInitV3 writes a v3 ChannelInit frame to w.
+// EncodeChannelInitV3 encodes a v3 ChannelInit struct into TLV bytes.
+func EncodeChannelInitV3(init ChannelInit) ([]byte, error) {
+	return encodeChannelInitV3(init)
+}
+
+// WriteChannelInitV3 serializes and writes a v3 ChannelInit frame.
 func WriteChannelInitV3(w io.Writer, init ChannelInit) error {
 	return writeChannelInitV3(w, init)
 }
 
-// ReadChannelInitV3 reads a v3 ChannelInit frame from r.
+// ReadChannelInitV3 reads and decodes a v3 ChannelInit frame.
 func ReadChannelInitV3(r io.Reader, maxSize int) (ChannelInit, error) {
 	return readChannelInitV3(r, maxSize)
 }
 
-// WriteChannelAcceptV3 writes a v3 ChannelAccept frame to w.
+// WriteChannelAcceptV3 serializes and writes a v3 ChannelAccept frame.
 func WriteChannelAcceptV3(w io.Writer, accept ChannelAccept) error {
 	return writeChannelAcceptV3(w, accept)
 }
 
-// ReadChannelAcceptOrRejectV3 reads either a ChannelAccept or ChannelReject frame in v3 format.
+// ReadChannelAcceptOrRejectV3 reads either a ChannelAccept or ChannelReject v3 frame.
 func ReadChannelAcceptOrRejectV3(r io.Reader, maxSize int) (ChannelAccept, ChannelReject, error) {
 	return readChannelAcceptOrRejectV3(r, maxSize)
 }
 
-// WriteChannelRejectV3 writes a v3 ChannelReject frame to w.
+// WriteChannelRejectV3 serializes and writes a v3 ChannelReject frame.
 func WriteChannelRejectV3(w io.Writer, reject ChannelReject) error {
 	return writeChannelRejectV3(w, reject)
 }
 
-func channelInitTranscriptV3(serverName, path string, init ChannelInit) ([]byte, error) {
+func channelInitTranscriptV3(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte, full bool) ([]byte, error) {
 	if len(init.SessionID) != 16 {
 		return nil, fmt.Errorf("session id must be 16 bytes")
 	}
@@ -474,8 +578,27 @@ func channelInitTranscriptV3(serverName, path string, init ChannelInit) ([]byte,
 	if len(init.ClientNonce) != 32 {
 		return nil, fmt.Errorf("client nonce must be 32 bytes")
 	}
+	if len(init.ClientEphPK) != 32 {
+		return nil, fmt.Errorf("client ephemeral public key must be 32 bytes")
+	}
+	if len(init.TAI64N) != 12 {
+		return nil, fmt.Errorf("tai64n timestamp must be 12 bytes")
+	}
+	if full {
+		if len(serverEphPK) != 32 {
+			return nil, fmt.Errorf("server ephemeral public key must be 32 bytes")
+		}
+		if !isSupportedCipherV3(negotiatedCipher) {
+			return nil, fmt.Errorf("unsupported cipher in transcript: %d", negotiatedCipher)
+		}
+	}
 	if len(init.CipherPref) < 1 || len(init.CipherPref) > 8 {
 		return nil, fmt.Errorf("cipher preference count must be between 1 and 8")
+	}
+	for _, c := range init.CipherPref {
+		if !isSupportedCipherV3(c) {
+			return nil, fmt.Errorf("unsupported cipher in preference: %d", c)
+		}
 	}
 	if len(serverName) > 65535 {
 		return nil, fmt.Errorf("server name too long")
@@ -484,7 +607,10 @@ func channelInitTranscriptV3(serverName, path string, init ChannelInit) ([]byte,
 		return nil, fmt.Errorf("path too long")
 	}
 
-	total := 137 + len(init.CipherPref) + 2 + len(serverName) + 2 + len(path)
+	total := 137 + len(init.CipherPref) + 2 + len(serverName) + 2 + len(path) + 12
+	if full {
+		total += 1
+	}
 	buf := make([]byte, total)
 	buf[0] = 0x01 // ChannelInit frame type
 	buf[1] = 0x03 // version 3
@@ -495,8 +621,10 @@ func channelInitTranscriptV3(serverName, path string, init ChannelInit) ([]byte,
 	copy(buf[24:56], init.ClientNonce)
 	binary.BigEndian.PutUint64(buf[56:64], uint64(init.Timestamp))
 	binary.BigEndian.PutUint64(buf[64:72], init.Capabilities)
-	// buf[72:104] is 32 zeros (client_eph_pk placeholder for P0)
-	// buf[104:136] is 32 zeros (server_eph_pk placeholder for P0)
+	copy(buf[72:104], init.ClientEphPK)
+	if full {
+		copy(buf[104:136], serverEphPK)
+	} // else buf[104:136] is 32 zeros (server_eph_pk placeholder for init transcript)
 	buf[136] = byte(len(init.CipherPref))
 	copy(buf[137:137+len(init.CipherPref)], init.CipherPref)
 	off := 137 + len(init.CipherPref)
@@ -507,12 +635,20 @@ func channelInitTranscriptV3(serverName, path string, init ChannelInit) ([]byte,
 	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(path)))
 	off += 2
 	copy(buf[off:off+len(path)], path)
+	off += len(path)
+	copy(buf[off:off+12], init.TAI64N)
+	off += 12
+	if full {
+		buf[off] = negotiatedCipher
+	}
 	return buf, nil
 }
 
 // ComputeV3TranscriptHash computes the SHA256 hash of the v3 handshake transcript.
-func ComputeV3TranscriptHash(serverName, path string, init ChannelInit) ([]byte, error) {
-	transcript, err := channelInitTranscriptV3(serverName, path, init)
+// When full is false, it computes transcript_hash_init (with server_eph_pk as 32 zeros, without negotiated cipher).
+// When full is true, it computes transcript_hash_full (with real server_eph_pk and negotiated cipher appended).
+func ComputeV3TranscriptHash(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte, full bool) ([]byte, error) {
+	transcript, err := channelInitTranscriptV3(serverName, path, init, serverEphPK, negotiatedCipher, full)
 	if err != nil {
 		return nil, err
 	}
@@ -520,9 +656,19 @@ func ComputeV3TranscriptHash(serverName, path string, init ChannelInit) ([]byte,
 	return hash[:], nil
 }
 
-// ComputeV3AuthProof computes the HMAC-SHA256 authentication proof for v3 ChannelInit.
+// ComputeV3TranscriptHashInit computes transcript_hash_init used for auth_proof computation and verification.
+func ComputeV3TranscriptHashInit(serverName, path string, init ChannelInit) ([]byte, error) {
+	return ComputeV3TranscriptHash(serverName, path, init, nil, 0, false)
+}
+
+// ComputeV3TranscriptHashFull computes transcript_hash_full used for server_proof and session key derivation.
+func ComputeV3TranscriptHashFull(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte) ([]byte, error) {
+	return ComputeV3TranscriptHash(serverName, path, init, serverEphPK, negotiatedCipher, true)
+}
+
+// ComputeV3AuthProof computes the HMAC-SHA256 authentication proof for v3 ChannelInit over transcript_hash_init.
 func ComputeV3AuthProof(token, serverName, path string, init ChannelInit) ([]byte, error) {
-	transcriptHash, err := ComputeV3TranscriptHash(serverName, path, init)
+	transcriptHash, err := ComputeV3TranscriptHashInit(serverName, path, init)
 	if err != nil {
 		return nil, err
 	}
@@ -542,10 +688,38 @@ func VerifyV3AuthProof(token, serverName, path string, init ChannelInit) bool {
 	if err != nil {
 		return false
 	}
-	if len(init.AuthProof) != 32 {
+	if len(init.AuthProof) != len(expected) {
 		return false
 	}
 	return hmac.Equal(init.AuthProof, expected)
+}
+
+// ComputeV3ServerProof computes the HMAC-SHA256 server proof over transcript_hash_full.
+func ComputeV3ServerProof(token, serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte) ([]byte, error) {
+	transcriptHash, err := ComputeV3TranscriptHashFull(serverName, path, init, serverEphPK, negotiatedCipher)
+	if err != nil {
+		return nil, err
+	}
+	authKeyReader := hkdf.New(sha256.New, []byte(token), []byte("x-tunnel-v3-auth"), []byte(serverName))
+	authKey := make([]byte, 32)
+	if _, err := io.ReadFull(authKeyReader, authKey); err != nil {
+		return nil, err
+	}
+	mac := hmac.New(sha256.New, authKey)
+	mac.Write(transcriptHash)
+	return mac.Sum(nil), nil
+}
+
+// VerifyV3ServerProof verifies the server proof in constant time against the expected HMAC-SHA256 over transcript_hash_full.
+func VerifyV3ServerProof(token, serverName, path string, init ChannelInit, accept ChannelAccept) bool {
+	expected, err := ComputeV3ServerProof(token, serverName, path, init, accept.ServerEphPK, accept.Cipher)
+	if err != nil {
+		return false
+	}
+	if len(accept.ServerProof) != len(expected) {
+		return false
+	}
+	return hmac.Equal(accept.ServerProof, expected)
 }
 
 // V3SessionKeys holds session seed and directional nonce prefixes.
@@ -555,40 +729,58 @@ type V3SessionKeys struct {
 	S2CNoncePrefix []byte
 }
 
-// DeriveV3SessionKeys derives v3 session keys from token and transcript hash using HKDF-SHA256.
-func DeriveV3SessionKeys(token string, transcriptHash []byte) (V3SessionKeys, error) {
+// DeriveV3SessionSeed derives v3 session keys from token, full transcript hash, and Diffie-Hellman shared secret using HKDF-SHA256.
+func DeriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3SessionKeys, error) {
 	if len(token) == 0 {
 		return V3SessionKeys{}, fmt.Errorf("empty token")
 	}
-	if len(transcriptHash) != 32 {
+	if len(transcriptHashFull) != 32 {
 		return V3SessionKeys{}, fmt.Errorf("transcript hash must be 32 bytes")
+	}
+	if len(shared) != 32 {
+		return V3SessionKeys{}, fmt.Errorf("shared secret must be 32 bytes")
 	}
 
 	prk := hkdf.Extract(sha256.New, []byte(token), []byte("xtunnel-v3-kdf"))
 
-	seedReader := hkdf.Expand(sha256.New, prk, transcriptHash)
+	seedReader := hkdf.Expand(sha256.New, prk, transcriptHashFull)
 	seed := make([]byte, 32)
 	if _, err := io.ReadFull(seedReader, seed); err != nil {
 		return V3SessionKeys{}, err
 	}
 
-	c2sReader := hkdf.Expand(sha256.New, seed, []byte("xtunnel-v3 c2s nonce"))
+	sessionSeedInfo := make([]byte, len("xtunnel-v3 fs mix")+len(shared))
+	copy(sessionSeedInfo, "xtunnel-v3 fs mix")
+	copy(sessionSeedInfo[len("xtunnel-v3 fs mix"):], shared)
+
+	sessionSeedReader := hkdf.Expand(sha256.New, seed, sessionSeedInfo)
+	sessionSeed := make([]byte, 32)
+	if _, err := io.ReadFull(sessionSeedReader, sessionSeed); err != nil {
+		return V3SessionKeys{}, err
+	}
+
+	c2sReader := hkdf.Expand(sha256.New, sessionSeed, []byte("xtunnel-v3 c2s nonce"))
 	c2sNoncePrefix := make([]byte, 4)
 	if _, err := io.ReadFull(c2sReader, c2sNoncePrefix); err != nil {
 		return V3SessionKeys{}, err
 	}
 
-	s2cReader := hkdf.Expand(sha256.New, seed, []byte("xtunnel-v3 s2c nonce"))
+	s2cReader := hkdf.Expand(sha256.New, sessionSeed, []byte("xtunnel-v3 s2c nonce"))
 	s2cNoncePrefix := make([]byte, 4)
 	if _, err := io.ReadFull(s2cReader, s2cNoncePrefix); err != nil {
 		return V3SessionKeys{}, err
 	}
 
 	return V3SessionKeys{
-		Seed:           seed,
+		Seed:           sessionSeed,
 		C2SNoncePrefix: c2sNoncePrefix,
 		S2CNoncePrefix: s2cNoncePrefix,
 	}, nil
+}
+
+// DeriveV3SessionKeys is a compatibility wrapper around DeriveV3SessionSeed with zero shared secret.
+func DeriveV3SessionKeys(token string, transcriptHash []byte) (V3SessionKeys, error) {
+	return DeriveV3SessionSeed(token, transcriptHash, make([]byte, 32))
 }
 
 // StreamKey derives a directional stream AEAD key for a specific cipher, stream ID, and generation.

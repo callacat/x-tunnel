@@ -44,11 +44,12 @@ const (
 )
 
 const (
-	protocolCapabilityStreamOpenV2 uint64 = 1 << 7
-	protocolCapabilityStatusV2     uint64 = 1 << 8
-	protocolCapabilityChannelStats uint64 = 1 << 9
-	protocolCapabilityDrainSignal  uint64 = 1 << 10
-	protocolCapabilityDatagramV2   uint64 = 1 << 11
+	protocolCapabilityStreamOpenV2   uint64 = 1 << 7
+	protocolCapabilityStatusV2       uint64 = 1 << 8
+	protocolCapabilityChannelStats   uint64 = 1 << 9
+	protocolCapabilityDrainSignal    uint64 = 1 << 10
+	protocolCapabilityDatagramV2     uint64 = 1 << 11
+	protocolCapabilityForwardSecrecy uint64 = 1 << 12
 )
 
 const (
@@ -86,6 +87,9 @@ type ChannelInit struct {
 	Capabilities uint64
 	AuthProof    []byte
 	CipherPref   []byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
+	ClientEphPK  []byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
+	TAI64N       []byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
+	Padding      []byte // optional padding (0x000b); ignored by transcript and server
 }
 
 type ChannelAccept struct {
@@ -95,7 +99,9 @@ type ChannelAccept struct {
 	MaxFrameSize uint32
 	MaxStreams   uint32
 	Message      string
-	Cipher       byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
+	Cipher       byte   // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
+	ServerEphPK  []byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
+	ServerProof  []byte // v3 only; v2 encoders ignore it, v2 decoders reject it as unknown critical
 }
 
 type ChannelReject struct {
@@ -105,7 +111,8 @@ type ChannelReject struct {
 
 func currentProtocolCapabilitiesV2() uint64 {
 	return uint64(currentProtocolCapabilities()) |
-		protocolCapabilityChannelStats
+		protocolCapabilityChannelStats |
+		protocolCapabilityForwardSecrecy
 }
 
 func requiredProtocolCapabilitiesV2() uint64 {
@@ -580,11 +587,12 @@ const (
 	V2RecordCapabilities = v2RecordCapabilities
 	V2RecordAuthProof    = v2RecordAuthProof
 
-	ProtocolCapabilityStreamOpenV2 = protocolCapabilityStreamOpenV2
-	ProtocolCapabilityStatusV2     = protocolCapabilityStatusV2
-	ProtocolCapabilityChannelStats = protocolCapabilityChannelStats
-	ProtocolCapabilityDrainSignal  = protocolCapabilityDrainSignal
-	ProtocolCapabilityDatagramV2   = protocolCapabilityDatagramV2
+	ProtocolCapabilityStreamOpenV2   = protocolCapabilityStreamOpenV2
+	ProtocolCapabilityStatusV2       = protocolCapabilityStatusV2
+	ProtocolCapabilityChannelStats   = protocolCapabilityChannelStats
+	ProtocolCapabilityDrainSignal    = protocolCapabilityDrainSignal
+	ProtocolCapabilityDatagramV2     = protocolCapabilityDatagramV2
+	ProtocolCapabilityForwardSecrecy = protocolCapabilityForwardSecrecy
 
 	V2RejectUnsupportedVersion        = v2RejectUnsupportedVersion
 	V2RejectMissingRequiredCapability = v2RejectMissingRequiredCapability
