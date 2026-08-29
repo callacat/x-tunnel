@@ -398,7 +398,9 @@ func (s *controlServer) handleRulesReload(w http.ResponseWriter, r *http.Request
 	writeControlJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": enabled, "rules": engine.Rules()})
 }
 
-// handleRouteStats 返回分流命中统计（读）。
+// handleRouteStats 返回分流命中统计 + GEO 库状态（读）。round40 可观测性：
+// Android 诊断包/状态卡据此展示「GEO 库是否就绪、规则条数、命中计数」，
+// 替代原先 route_stats 全 -1 的黑盒。
 func (s *controlServer) handleRouteStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
@@ -406,10 +408,18 @@ func (s *controlServer) handleRouteStats(w http.ResponseWriter, r *http.Request)
 	}
 	engine, _ := s.engine.routeSnapshot()
 	if engine == nil {
-		writeControlJSON(w, http.StatusOK, map[string]any{"enabled": false, "stats": route.Stats{}})
+		writeControlJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"stats":   route.Stats{},
+			"geo":     route.GeoStatus{},
+		})
 		return
 	}
-	writeControlJSON(w, http.StatusOK, map[string]any{"enabled": true, "stats": engine.Stats()})
+	writeControlJSON(w, http.StatusOK, map[string]any{
+		"enabled": true,
+		"stats":   engine.Stats(),
+		"geo":     engine.GeoStatus(),
+	})
 }
 
 // routeSnapshot 返回分流引擎引用与启用标志（并发安全读）。

@@ -40,7 +40,19 @@ const (
 )
 
 // updateHTTPClient 是 GEO 下载专用客户端（超时在每次请求上单独设置）。
+// 默认直连；SetDownloadProxy 可注入 SOCKS5 代理客户端（Android sidecar 场景）。
 var updateHTTPClient = &http.Client{}
+
+// SetDownloadProxy 注入 GEO 下载用的 HTTP 客户端。Android 端 sidecar 直连
+// 物理网络在境内拉 GitHub 必败（round39 真机实锤：GEO 库永远下载不下来），
+// 需要改走本机 SOCKS5 listener（隧道出口）下载。传 nil 恢复默认直连。
+func SetDownloadProxy(client *http.Client) {
+	if client == nil {
+		updateHTTPClient = &http.Client{}
+		return
+	}
+	updateHTTPClient = client
+}
 
 // UpdateGeoData 更新 GEO 数据库：下载 siteURL 与 ipURL 两个文件到 geoDir，
 // 返回 (updated, err)。

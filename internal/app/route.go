@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -108,6 +109,21 @@ func (e *Engine) initRouteEngine() error {
 	routeRT.setEngine(engine)
 	e.routeEngine = engine
 
+	// GEO 下载走隧道（round40 根因修复）：sidecar 在 VPN 外直连物理网，境内
+	// 拉 GitHub（MetaCubeX release）必败 → GEO 库永远缺失 → geosite/geoip 规则
+	// 全不命中。注入 SOCKS5 代理客户端：经本机 listener（如 127.0.0.1:11080）
+	// → 隧道 → 服务端出网下载。sidecar 自身 connect 在 VPN 外，天然防环。
+	if proxyURL := firstSOCKS5ListenAddr(v.ListenAddr); proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
+			route.SetDownloadProxy(&http.Client{
+				Transport: &http.Transport{
+					Proxy: http.ProxyURL(&url.URL{Scheme: "socks5", Host: u.Host}),
+				},
+			})
+			log.Printf("[分流] GEO 下载走隧道代理 %s", u.Host)
+		}
+	}
+
 	// 异步首次 GEO 下载（失败只 warning，不阻塞启动；更新走控制 API 手动触发）。
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -119,6 +135,18 @@ func (e *Engine) initRouteEngine() error {
 		}
 	}()
 	return nil
+}
+
+// firstSOCKS5ListenAddr 从监听地址列表（逗号分隔，可含 http:// / tcp:// 混合）
+// 中取第一个 socks5:// 地址；无则返回空串。
+func firstSOCKS5ListenAddr(listenAddr string) string {
+	for _, raw := range strings.Split(listenAddr, ",") {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "socks5://") {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // ======================== Match 接入（SOCKS5/HTTP 共用） ========================
@@ -133,11 +161,20 @@ const (
 
 // decideForTarget 对目标 host 做分流判定。host 需已 SplitHostPort 去端口；
 // ip 为已解析地址（可为零值）。引擎未启用时恒 proxy。
+//
+// 兜底语义（round40 根因修复，对齐 warp-go decision.go 防被墙）：
+//   - matched=true → 按规则 action 执行
+//   - matched=false（规则全部未命中，如 GEO 库缺失/目标不在规则内）→ **proxy 走隧道**，
+//     绝不直连——直接把未命中当 direct 会让「GEO 库下载失败」放大成「全部流量直连」
+//     （round39 真机实锤：GEO 开启后所有网络直连、隧道空转），且被墙目标直连必失败。
 func decideForTarget(host string, ip netip.Addr) routeAction {
 	if routeRT.engineSnapshot() == nil {
 		return routeProxy
 	}
-	action, _ := routeRT.match(host, ip)
+	action, matched := routeRT.match(host, ip)
+	if !matched {
+		return routeProxy
+	}
 	switch action {
 	case route.ActionDirect:
 		return routeDirect

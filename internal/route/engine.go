@@ -8,6 +8,7 @@ import (
 	"context"
 	"log"
 	"path/filepath"
+	"time"
 )
 
 // NewEngine 创建分流引擎：
@@ -128,6 +129,46 @@ func (e *Engine) Stats() Stats {
 		RejectedHits: e.statsReject.Load(),
 		Misses:       e.statsMiss.Load(),
 	}
+}
+
+// GeoStatus 返回 GEO 数据库加载状态与规则规模（可观测性，round40）。
+// Android 端诊断包/状态卡据此展示「GEO 库是否就绪、规则多少条」，不再
+// 出现「不知道有没有下载到本地并应用上」的黑盒状态。
+type GeoStatus struct {
+	SiteLoaded     bool      `json:"site_loaded"`     // geosite.dat 是否已加载
+	SiteCategories int       `json:"site_categories"` // geosite 类别数
+	SitePath       string    `json:"site_path,omitempty"`
+	SiteLoadedAt   time.Time `json:"site_loaded_at,omitempty"`
+	IPLoaded       bool      `json:"ip_loaded"` // geoip-lite.dat 是否已加载
+	IPCategories   int       `json:"ip_categories"`
+	IPPrefixes     int       `json:"ip_prefixes"`
+	IPPath         string    `json:"ip_path,omitempty"`
+	IPLoadedAt     time.Time `json:"ip_loaded_at,omitempty"`
+	RuleCount      int       `json:"rule_count"`         // 当前生效规则条数
+	Fallback       string    `json:"fallback,omitempty"` // default: 兜底声明（空=未声明）
+}
+
+func (e *Engine) GeoStatus() GeoStatus {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	st := GeoStatus{
+		RuleCount: len(e.rules),
+		Fallback:  e.fallback,
+	}
+	if e.geoSite != nil {
+		st.SiteLoaded = true
+		st.SiteCategories = e.geoSite.CategoryCount()
+		st.SitePath = e.geoSite.Path()
+		st.SiteLoadedAt = e.geoSite.LoadedAt()
+	}
+	if e.geoIP != nil {
+		st.IPLoaded = true
+		st.IPCategories = e.geoIP.CategoryCount()
+		st.IPPrefixes = e.geoIP.PrefixCount()
+		st.IPPath = e.geoIP.Path()
+		st.IPLoadedAt = e.geoIP.LoadedAt()
+	}
+	return st
 }
 
 // Close 停止规则热重载监听 goroutine。
