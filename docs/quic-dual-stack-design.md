@@ -1,7 +1,7 @@
-# x-tunnel QUIC/TCP 双栈传输层设计规范 (P2 阶段)
+# x-tunnel QUIC/TCP 双栈传输层设计与实现规范 (v3 阶段)
 
-状态: 架构设计稿 (Design Document)
-交付阶段: P2 阶段传输层双栈核心设计 ("先出设计再动代码")
+状态: 已实现落地并通过全量验证 (Implemented & Verified)
+交付阶段: v3 传输层双栈核心架构落地 (Phase 1~4 全量实现)
 设计依据: 
 - `docs/protocol-v3-optimization.md` §3 (传输层双栈与会话层统一)
 - `docs/protocol-v3-research/mux-transport.md` (多路复用与传输层优化研究)

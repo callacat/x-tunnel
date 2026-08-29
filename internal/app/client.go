@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/xtaci/smux"
+	"x-tunnel/internal/transport"
 )
 
 // defaultCipherPreference defines the default client cipher suite preference list.
@@ -37,13 +39,17 @@ type ECHPool struct {
 	targetIPs     []string
 	clientID      string
 
-	wsConnsMu      sync.RWMutex
-	smuxConns      []*smux.Session
-	channelRTT     []int64
-	channelCaps    []uint64
-	channelKeys    []V3SessionKeys
-	channelCiphers []byte
-	selectCounter  uint64
+	wsConnsMu         sync.RWMutex
+	transportSessions []transport.TransportSession
+	smuxConns         []*smux.Session
+	channelRTT        []int64
+	channelCaps       []uint64
+	channelKeys       []V3SessionKeys
+	channelCiphers    []byte
+	selectCounter     uint64
+	selector          *transport.TransportSelector
+	endpointPool      *transport.EndpointPool
+	coverTraffic      bool
 }
 
 func (p *ECHPool) channelV3Security(idx int) (V3SessionKeys, byte, bool) {
@@ -61,15 +67,25 @@ func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 		total = len(ips) * n
 	}
 	p := &ECHPool{
-		wsServerAddr:   addr,
-		connectionNum:  n,
-		targetIPs:      ips,
-		clientID:       clientID,
-		smuxConns:      make([]*smux.Session, total),
-		channelRTT:     make([]int64, total),
-		channelCaps:    make([]uint64, total),
-		channelKeys:    make([]V3SessionKeys, total),
-		channelCiphers: make([]byte, total),
+		wsServerAddr:      addr,
+		connectionNum:     n,
+		targetIPs:         ips,
+		clientID:          clientID,
+		transportSessions: make([]transport.TransportSession, total),
+		smuxConns:         make([]*smux.Session, total),
+		channelRTT:        make([]int64, total),
+		channelCaps:       make([]uint64, total),
+		channelKeys:       make([]V3SessionKeys, total),
+		channelCiphers:    make([]byte, total),
+		coverTraffic:      coverTraffic,
+	}
+	mode := transport.TransportType(strings.ToLower(strings.TrimSpace(transportMode)))
+	if mode == "" {
+		mode = transport.TransportTypeAuto
+	}
+	p.selector = transport.NewTransportSelector(mode, nil, nil)
+	if len(ips) > 0 {
+		p.endpointPool = transport.NewEndpointPool(ips, 3, 60*time.Second)
 	}
 	return p
 }
@@ -104,61 +120,130 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		if ctx.Err() != nil {
 			return
 		}
-		wsConn, err := dialWebSocketWithECH(p.wsServerAddr, 3, ip)
+
+		targetIP := ip
+		if p.endpointPool != nil {
+			if nextIP, err := p.endpointPool.SelectNext(); err == nil && nextIP != "" {
+				targetIP = nextIP
+			}
+		}
+
+		dialStart := time.Now()
+		var sess transport.TransportSession
+		var err error
+
+		tlsConf := &tls.Config{
+			InsecureSkipVerify: insecure,
+		}
+		if clientCertFile != "" && clientKeyFile != "" {
+			cert, certErr := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+			if certErr == nil {
+				tlsConf.Certificates = []tls.Certificate{cert}
+			}
+		}
+
+		isWSS := strings.HasPrefix(strings.ToLower(p.wsServerAddr), "wss://")
+		if isWSS && p.selector != nil && (p.selector.Mode() == transport.TransportTypeAuto || p.selector.Mode() == transport.TransportTypeQUIC) && !frontProxyEnabled() {
+			serverName := ""
+			if u, errParse := url.Parse(p.wsServerAddr); errParse == nil && u != nil {
+				serverName = u.Hostname()
+			}
+			tlsConf, _ := buildUnifiedTLSConfig(serverName)
+			opts := transport.DialOptions{
+				TLSConfig:         tlsConf,
+				TargetIP:          targetIP,
+				ServerName:        serverName,
+				Timeout:           cfg.WSHandshakeTimeout,
+				KeepAliveInterval: 10 * time.Second,
+				MaxIdleTimeout:    30 * time.Second,
+				EnableDatagrams:   enableDatagram,
+			}
+			sess, err = p.selector.DialSession(ctx, p.wsServerAddr, opts)
+		} else {
+			wsConn, dialErr := dialWebSocketWithECH(p.wsServerAddr, 3, targetIP)
+			if dialErr != nil {
+				err = dialErr
+			} else {
+				wsNet := newWSNetConn(wsConn)
+				smuxSess, smuxErr := smux.Client(wsNet, newSmuxConfig())
+				if smuxErr != nil {
+					_ = wsConn.Close()
+					err = smuxErr
+				} else {
+					sess = transport.NewTcpTransportSession(smuxSess, wsNet)
+				}
+			}
+		}
+
 		if err != nil {
+			if p.endpointPool != nil && targetIP != "" {
+				p.endpointPool.RecordResult(targetIP, false, 0)
+			}
 			if !sleepBeforeReconnect(fmt.Sprintf("连接失败: %v", err)) {
 				return
 			}
 			continue
 		}
-		wsNet := newWSNetConn(wsConn)
-		sess, err := smux.Client(wsNet, newSmuxConfig())
-		if err != nil {
-			_ = wsConn.Close()
-			if !sleepBeforeReconnect(fmt.Sprintf("smux 初始化失败: %v", err)) {
-				return
-			}
-			continue
-		}
+
 		caps, keys, cipher, err := negotiateClientProtocol(sess, cfg.RTTProbeTimeout, p.clientID, uint32(chID), p.wsServerAddr)
 		if err != nil {
 			atomic.AddUint64(&clientProtocolFailureSeq, 1)
 			_ = sess.Close()
-			_ = wsConn.Close()
-			if !sleepBeforeReconnect(fmt.Sprintf("协议协商失败: %v", err)) {
+			if p.endpointPool != nil && targetIP != "" {
+				p.endpointPool.RecordResult(targetIP, false, 0)
+			}
+			failReason := fmt.Sprintf("协议协商失败: %v", err)
+			if strings.Contains(err.Error(), "certificate required") || strings.Contains(err.Error(), "CRYPTO_ERROR") || strings.Contains(err.Error(), "tls:") {
+				failReason = fmt.Sprintf("连接失败: %v", err)
+			}
+			if !sleepBeforeReconnect(failReason) {
 				return
 			}
 			continue
 		}
 		atomic.AddUint64(&clientProtocolOKSeq, 1)
-		log.Printf("[客户端] 通道 %d (IP:%s) v3 协议协商成功: version=3 caps=0x%x cipher=%s", chID, ipLabel, caps, v3CipherName(cipher))
+		log.Printf("[客户端] 通道 %d (IP:%s) v3 协议协商成功: transport=%s version=3 caps=0x%x cipher=%s", chID, ipLabel, sess.Type(), caps, v3CipherName(cipher))
+
 		p.wsConnsMu.Lock()
-		p.smuxConns[idx] = sess
+		if idx < len(p.transportSessions) {
+			p.transportSessions[idx] = sess
+		}
+		if idx < len(p.smuxConns) {
+			if tcpSess, ok := sess.(*transport.TcpTransportSession); ok {
+				p.smuxConns[idx] = tcpSess.RawSession()
+			} else {
+				p.smuxConns[idx] = nil
+			}
+		}
 		p.channelRTT[idx] = 0
 		p.channelCaps[idx] = caps
 		p.channelKeys[idx] = keys
 		p.channelCiphers[idx] = cipher
 		p.wsConnsMu.Unlock()
-		log.Printf("[客户端] 通道 %d (IP:%s) 就绪 (smux)", chID, ipLabel)
+		log.Printf("[客户端] 通道 %d (IP:%s) 就绪 (%s)", chID, ipLabel, sess.Type())
 		reconnectAttempt = 0
+
 		if rtt, err := p.probeChannelRTTOnce(sess, idx, cfg.RTTProbeTimeout); err == nil {
 			atomic.StoreInt64(&p.channelRTT[idx], rtt)
+			if p.endpointPool != nil && targetIP != "" {
+				p.endpointPool.RecordResult(targetIP, true, time.Duration(rtt))
+			}
 		} else {
 			atomic.AddUint64(&clientRTTProbeFailureSeq, 1)
+			if p.endpointPool != nil && targetIP != "" {
+				p.endpointPool.RecordResult(targetIP, true, time.Since(dialStart))
+			}
 		}
 
 		done := make(chan error, 1)
 		go p.probeChannelRTT(sess, idx, done)
+		if p.coverTraffic {
+			go p.runCoverTraffic(ctx, sess, idx)
+		}
+
 		var probeErr error
 		select {
 		case probeErr = <-done:
-		case <-wsNet.Dead():
-			_ = sess.Close()
-			<-done
-			probeErr = wsNet.DeadErr()
-			if probeErr == nil {
-				probeErr = io.EOF
-			}
 		case <-ctx.Done():
 			_ = sess.Close()
 			<-done
@@ -166,10 +251,14 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		}
 
 		_ = sess.Close()
-		_ = wsConn.Close()
 
 		p.wsConnsMu.Lock()
-		p.smuxConns[idx] = nil
+		if idx < len(p.transportSessions) {
+			p.transportSessions[idx] = nil
+		}
+		if idx < len(p.smuxConns) {
+			p.smuxConns[idx] = nil
+		}
 		p.channelRTT[idx] = 0
 		p.channelCaps[idx] = 0
 		p.channelKeys[idx] = V3SessionKeys{}
@@ -187,7 +276,23 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 	}
 }
 
-func (p *ECHPool) probeChannelRTT(sess *smux.Session, idx int, done chan error) {
+func (p *ECHPool) runCoverTraffic(ctx context.Context, sess transport.TransportSession, idx int) {
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if sess == nil || sess.IsClosed() {
+				return
+			}
+			_, _ = p.probeChannelRTTOnce(sess, idx, 2*time.Second)
+		}
+	}
+}
+
+func (p *ECHPool) probeChannelRTT(sessAny any, idx int, done chan error) {
 	var exitErr error
 	defer func() {
 		done <- exitErr
@@ -196,11 +301,17 @@ func (p *ECHPool) probeChannelRTT(sess *smux.Session, idx int, done chan error) 
 	ticker := time.NewTicker(cfg.RTTProbeTimeout)
 	defer ticker.Stop()
 	for {
-		rtt, err := p.probeChannelRTTOnce(sess, idx, cfg.RTTProbeTimeout)
+		rtt, err := p.probeChannelRTTOnce(sessAny, idx, cfg.RTTProbeTimeout)
 		if err != nil {
 			atomic.AddUint64(&clientRTTProbeFailureSeq, 1)
 			atomic.StoreInt64(&p.channelRTT[idx], int64(cfg.RTTProbeTimeout.Nanoseconds()))
-			if sess.IsClosed() {
+			var isClosed bool
+			if sess, ok := sessAny.(transport.TransportSession); ok {
+				isClosed = sess.IsClosed()
+			} else if smuxSess, ok := sessAny.(*smux.Session); ok {
+				isClosed = smuxSess.IsClosed()
+			}
+			if isClosed {
 				exitErr = err
 				return
 			}
@@ -208,19 +319,37 @@ func (p *ECHPool) probeChannelRTT(sess *smux.Session, idx int, done chan error) 
 			continue
 		}
 		atomic.StoreInt64(&p.channelRTT[idx], rtt)
-		<-ticker.C
+		select {
+		case <-ticker.C:
+		case <-done:
+			return
+		}
 	}
 }
 
-func (p *ECHPool) probeChannelRTTOnce(sess *smux.Session, idx int, timeout time.Duration) (int64, error) {
+func (p *ECHPool) probeChannelRTTOnce(sessAny any, idx int, timeout time.Duration) (int64, error) {
 	keys, cipher, ok := p.channelV3Security(idx)
 	if !ok {
 		return 0, fmt.Errorf("通道安全配置不可用")
 	}
 	start := time.Now()
-	s, err := sess.OpenStream()
-	if err != nil {
-		return 0, err
+	var s transport.TransportStream
+	if sess, ok := sessAny.(transport.TransportSession); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		st, err := sess.OpenStream(ctx)
+		if err != nil {
+			return 0, err
+		}
+		s = st
+	} else if smuxSess, ok := sessAny.(*smux.Session); ok {
+		st, err := smuxSess.OpenStream()
+		if err != nil {
+			return 0, err
+		}
+		s = transport.NewTcpTransportStream(st)
+	} else {
+		return 0, fmt.Errorf("unsupported session type: %T", sessAny)
 	}
 	defer s.Close()
 	cs, err := newV3CipherStream(s, keys, cipher, s.ID(), true)
@@ -250,10 +379,24 @@ func (p *ECHPool) probeChannelRTTOnce(sess *smux.Session, idx int, timeout time.
 	return rtt, nil
 }
 
-func negotiateClientProtocol(sess *smux.Session, timeout time.Duration, clientID string, channelID uint32, serverAddr string) (uint64, V3SessionKeys, byte, error) {
-	s, err := sess.OpenStream()
-	if err != nil {
-		return 0, V3SessionKeys{}, 0, err
+func negotiateClientProtocol(sessAny any, timeout time.Duration, clientID string, channelID uint32, serverAddr string) (uint64, V3SessionKeys, byte, error) {
+	var s transport.TransportStream
+	if sess, ok := sessAny.(transport.TransportSession); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		st, err := sess.OpenStream(ctx)
+		if err != nil {
+			return 0, V3SessionKeys{}, 0, err
+		}
+		s = st
+	} else if smuxSess, ok := sessAny.(*smux.Session); ok {
+		st, err := smuxSess.OpenStream()
+		if err != nil {
+			return 0, V3SessionKeys{}, 0, err
+		}
+		s = transport.NewTcpTransportStream(st)
+	} else {
+		return 0, V3SessionKeys{}, 0, fmt.Errorf("unsupported session type: %T", sessAny)
 	}
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(timeout))
@@ -487,25 +630,38 @@ func logClientConnEvent(c net.Conn, reqType, target string, chID int, opened boo
 	log.Printf("[客户端] %s %s %s %s 通道 %d", clientSourceAddr(c), reqType, arrow, target, chID)
 }
 
-func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, V3SessionKeys, byte, error) {
+func (p *ECHPool) openBestStream() (transport.TransportStream, int, int, uint64, V3SessionKeys, byte, error) {
 	p.wsConnsMu.RLock()
 	type candidate struct {
 		idx int
 		rtt int64
 	}
-	cands := make([]candidate, 0, len(p.smuxConns))
-	for i, sess := range p.smuxConns {
-		if sess == nil || sess.IsClosed() {
+	totalSlots := len(p.transportSessions)
+	if len(p.smuxConns) > totalSlots {
+		totalSlots = len(p.smuxConns)
+	}
+	cands := make([]candidate, 0, totalSlots)
+	for i := 0; i < totalSlots; i++ {
+		var isClosed bool = true
+		if i < len(p.transportSessions) && p.transportSessions[i] != nil {
+			isClosed = p.transportSessions[i].IsClosed()
+		} else if i < len(p.smuxConns) && p.smuxConns[i] != nil {
+			isClosed = p.smuxConns[i].IsClosed()
+		}
+		if isClosed {
 			continue
 		}
-		rtt := atomic.LoadInt64(&p.channelRTT[i])
+		rtt := int64(0)
+		if i < len(p.channelRTT) {
+			rtt = atomic.LoadInt64(&p.channelRTT[i])
+		}
 		if rtt <= 0 {
 			rtt = int64(cfg.RTTProbeTimeout.Nanoseconds())
 		}
 		cands = append(cands, candidate{idx: i, rtt: rtt})
 	}
-	p.wsConnsMu.RUnlock()
 	if len(cands) == 0 {
+		p.wsConnsMu.RUnlock()
 		return nil, 0, 0, 0, V3SessionKeys{}, 0, fmt.Errorf("无可用 smux 通道")
 	}
 	minRTT := cands[0].rtt
@@ -523,8 +679,14 @@ func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, V3SessionKey
 	}
 	pick := int(atomic.AddUint64(&p.selectCounter, 1)-1) % len(near)
 	best := near[pick]
-	p.wsConnsMu.RLock()
-	sess := p.smuxConns[best.idx]
+
+	var sess transport.TransportSession
+	if best.idx < len(p.transportSessions) && p.transportSessions[best.idx] != nil {
+		sess = p.transportSessions[best.idx]
+	} else if best.idx < len(p.smuxConns) && p.smuxConns[best.idx] != nil {
+		sess = transport.NewTcpTransportSession(p.smuxConns[best.idx], nil)
+	}
+
 	var caps uint64
 	if best.idx < len(p.channelCaps) {
 		caps = p.channelCaps[best.idx]
@@ -538,11 +700,14 @@ func (p *ECHPool) openBestStream() (*smux.Stream, int, int, uint64, V3SessionKey
 		cipher = p.channelCiphers[best.idx]
 	}
 	p.wsConnsMu.RUnlock()
+
 	if sess == nil || sess.IsClosed() {
 		return nil, 0, 0, 0, V3SessionKeys{}, 0, fmt.Errorf("通道不可用")
 	}
 	decision := best.idx + 1
-	s, err := sess.OpenStream()
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.DialTimeout)
+	defer cancel()
+	s, err := sess.OpenStream(ctx)
 	if err != nil {
 		return nil, 0, 0, 0, V3SessionKeys{}, 0, err
 	}

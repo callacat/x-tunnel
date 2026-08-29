@@ -479,7 +479,22 @@ Successful CONNECT returns `HTTP/1.1 200 Connection Established` without
 - Server-side egress policy is pre-dial: CIDR rules apply to literal IP targets,
   and host rules apply to literal domain targets before DNS resolution.
 
-## 11. Evolution Rules
+## 11. Dual-Stack Transport Architecture (QUIC + TCP/WSS) & RFC 9221 Datagram
+
+### Dual-Stack Selection and Auto-Fallback
+- **Modes**: `auto` (default), `quic`, `tcp`.
+- **Auto Mode**: Probes QUIC first with a 1.5s fallback deadline (`quicFallbackTimeout`).
+- **Host Memory Cache**: Caches connection success/failure per endpoint host. If QUIC fails repeatedly, automatic cooldown prevents redundant connection delays and connects via TCP/WSS directly while probing in the background.
+- **Transport Abstraction**: Core v3 authentication and AEAD recording layers operate on top of `transport.TransportSession` and `transport.TransportStream`, cleanly decoupling transport protocols from encryption and application logic.
+
+### RFC 9221 QUIC Datagram Framing
+- Format: `AssocID (2B) + PktID (2B) + FragTotal (1B) + FragID (1B) + PayloadLen (2B) + AddrType (1B) + TargetAddr (var) + TargetPort (2B) + Payload (var)`.
+- Reassembler: Multi-fragment datagrams are reassembled with bounded capacity and TTL eviction.
+
+### Multi-IP Rotation & Block Detection (P3)
+- `EndpointPool` maintains multiple server IPs, monitors connection health, auto-demotes failed IPs with circuit-breaking cooldown, and rotates across available healthy endpoints.
+
+## 12. Evolution Rules
 
 - Keep authentication and capability negotiation on v3 control frames.
 - Keep the hot TCP/UDP payload path inside AEAD streams without redundant framing.

@@ -25,6 +25,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/xtaci/smux"
+	"x-tunnel/internal/transport"
 )
 
 var (
@@ -87,10 +88,28 @@ type WSChannel struct {
 	capabilities uint64
 	v3Keys       V3SessionKeys
 	v3Cipher     byte
+	transport    transport.TransportSession
 }
 
-func wrapV3DataStream(ch *WSChannel, stream *smux.Stream) (*V3CipherStream, error) {
-	return newV3CipherStream(stream, ch.v3Keys, ch.v3Cipher, stream.ID(), false)
+func wrapV3DataStream(ch *WSChannel, stream any) (*V3CipherStream, error) {
+	var id uint32
+	var rwc io.ReadWriteCloser
+	if ts, ok := stream.(transport.TransportStream); ok {
+		id = ts.ID()
+		rwc = ts
+	} else if smuxSt, ok := stream.(*smux.Stream); ok {
+		id = smuxSt.ID()
+		rwc = smuxSt
+	} else if streamer, ok := stream.(interface {
+		io.ReadWriteCloser
+		ID() uint32
+	}); ok {
+		id = streamer.ID()
+		rwc = streamer
+	} else {
+		return nil, fmt.Errorf("unsupported stream type: %T", stream)
+	}
+	return newV3CipherStream(rwc, ch.v3Keys, ch.v3Cipher, id, false)
 }
 
 type ClientSession struct {
@@ -152,7 +171,12 @@ func (s *ClientSession) addChannel(wsConn *websocket.Conn, preferredID uint64) *
 	s.channels[ch.id] = ch
 	s.mu.Unlock()
 	if replaced != nil {
-		_ = replaced.conn.Close()
+		if replaced.conn != nil {
+			_ = replaced.conn.Close()
+		}
+		if replaced.transport != nil {
+			_ = replaced.transport.Close()
+		}
 	}
 	return ch
 }
@@ -306,6 +330,48 @@ func startWebSocketServer(ctx context.Context, addr string, allowedNets []*net.I
 			log.Printf("[服务端] mTLS 客户端证书认证已启用")
 		}
 		log.Printf("[服务端] WSS 启动 %s%s", u.Host, path)
+
+		quicAddr := u.Host
+		if quicPort > 0 {
+			if h, _, err := net.SplitHostPort(u.Host); err == nil {
+				quicAddr = net.JoinHostPort(h, strconv.Itoa(quicPort))
+			} else {
+				quicAddr = net.JoinHostPort(u.Host, strconv.Itoa(quicPort))
+			}
+		}
+		quicTr := transport.NewQuicTransport()
+		quicLn, quicErr := quicTr.Listen(ctx, quicAddr, transport.ListenOptions{
+			TLSConfig:       server.TLSConfig,
+			EnableDatagrams: enableDatagram,
+		})
+		if quicErr != nil {
+			log.Printf("[服务端] QUIC 监听未启动 (%s): %v", quicAddr, quicErr)
+		} else {
+			log.Printf("[服务端] QUIC 启动 %s (UDP)", quicAddr)
+			go func() {
+				<-ctx.Done()
+				_ = quicLn.Close()
+			}()
+			go func() {
+				for {
+					qSess, err := quicLn.AcceptSession(ctx)
+					if err != nil {
+						return
+					}
+					clientIP := "-"
+					if ra := qSess.RemoteAddr(); ra != nil {
+						if h, _, err := net.SplitHostPort(ra.String()); err == nil {
+							clientIP = h
+						}
+					}
+					serverName := u.Hostname()
+					if serverName == "" {
+						serverName = u.Host
+					}
+					go handlePreAuthTransportSession(qSess, qSess, clientIP, serverName, path)
+				}
+			}()
+		}
 	} else {
 		log.Printf("[服务端] WS 启动 %s%s", u.Host, path)
 	}
@@ -662,68 +728,93 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 		log.Printf("[服务端] v3 预认证 smux 初始化失败: %v", err)
 		return
 	}
-	defer sess.Close()
+	transportSess := transport.NewTcpTransportSession(sess, wsConn)
+	handlePreAuthTransportSession(transportSess, wsConn, clientIP, serverName, path)
+}
 
-	stream, err := sess.AcceptStream()
+func handlePreAuthTransportSession(sess transport.TransportSession, closer io.Closer, clientIP string, serverName string, path string) {
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.PreAuthTimeout)
+	defer cancel()
+
+	stream, err := sess.AcceptStream(ctx)
 	if err != nil {
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		log.Printf("[服务端] v3 预认证等待 ChannelInit 失败: %v", err)
 		return
 	}
 	defer stream.Close()
 	_ = stream.SetDeadline(time.Now().Add(cfg.PreAuthTimeout))
+
 	init, err := readChannelInitV3(stream, maxV2FrameSize)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelInit 读取失败: %v", err)
 		return
 	}
 	if _, err := decodeTAI64N(init.TAI64N); err != nil {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelInit TAI64N 格式非法: %v 来源 IP: %s", err, clientIP)
 		return
 	}
 	now := time.Now()
 	if !validateChannelInitTime(now, init.Timestamp, cfg.AuthSkew) {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelInit 时间戳拒绝，来源 IP: %s", clientIP)
 		return
 	}
 	if len(init.ClientEphPK) != 32 {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelInit 客户端公钥长度非法，来源 IP: %s", clientIP)
 		return
 	}
 	if !verifyV3AuthProof(token, serverName, path, init) {
 		atomic.AddUint64(&serverAuthRejectSeq, 1)
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 认证失败，来源 IP: %s", clientIP)
 		return
 	}
 	if serverNonceCache.seenOrStore(init.SessionID, init.ChannelID, init.ClientNonce, now, cfg.AuthSkew) {
 		atomic.AddUint64(&serverProtocolReplaySeq, 1)
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelInit nonce 重放，来源 IP: %s", clientIP)
 		return
 	}
 	if !serverTAI64NCache.CheckAndStore(init.SessionID, init.TAI64N) {
 		atomic.AddUint64(&serverTAI64NRejectSeq, 1)
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelInit TAI64N 重放或非单调递增，来源 IP: %s", clientIP)
 		return
 	}
 	required := requiredProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy
 	if init.Capabilities&required != required {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelInit 缺少必需能力 (got 0x%x, want 0x%x)，来源 IP: %s", init.Capabilities, required, clientIP)
 		return
 	}
@@ -731,7 +822,9 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	chosenCipher, rejectCode, msg := negotiateCipherV3(init.CipherPref)
 	if rejectCode != 0 {
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 加密算法协商失败: %s IP: %s", msg, clientIP)
 		return
 	}
@@ -740,7 +833,9 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	session, ok := getOrCreateClientSession(sessionID)
 	if !ok {
 		atomic.AddUint64(&serverClientRejectSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] 拒绝 v3 客户端会话: session=%s max-clients=%d", shortID(sessionID), maxClientSessions)
 		return
 	}
@@ -748,7 +843,9 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	serverSk, serverPk, err := newV3ClientEphemeralKey()
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 生成 ephemeral 密钥失败: %v", err)
 		return
 	}
@@ -761,7 +858,9 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	shared, err := computeV3SharedSecret(serverSk, init.ClientEphPK)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 计算共享秘密失败: %v", err)
 		return
 	}
@@ -769,7 +868,9 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	thFull, err := computeV3TranscriptHashFull(serverName, path, init, serverPk, chosenCipher)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 计算 transcript hash 失败: %v", err)
 		return
 	}
@@ -777,7 +878,9 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	serverProof, err := computeV3ServerProof(token, serverName, path, init, serverPk, chosenCipher)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 计算 server proof 失败: %v", err)
 		return
 	}
@@ -785,20 +888,29 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	keys, err := deriveV3SessionSeed(token, thFull, shared)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 派生会话密钥失败: %v", err)
 		return
+	}
+	var wsConn *websocket.Conn
+	if ws, ok := closer.(*websocket.Conn); ok {
+		wsConn = ws
 	}
 	ch := session.addChannel(wsConn, uint64(init.ChannelID))
 	atomic.StoreUint64(&ch.capabilities, caps)
 	ch.v3Keys = keys
 	ch.v3Cipher = chosenCipher
+	ch.transport = sess
 
 	serverNonce := make([]byte, 32)
 	if _, err := rand.Read(serverNonce); err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		session.removeChannel(ch.id, ch)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 生成服务端 nonce 失败: %v", err)
 		return
 	}
@@ -817,16 +929,117 @@ func handlePreAuthWebSocketChannel(wsConn *websocket.Conn, clientIP string, serv
 	if err := writeChannelAcceptV3(stream, accept); err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		session.removeChannel(ch.id, ch)
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		log.Printf("[服务端] v3 ChannelAccept 写入失败: %v", err)
 		return
 	}
 	atomic.AddUint64(&serverProtocolOKSeq, 1)
-	log.Printf("[服务端] v3 客户端通道 %d 连接, 会话ID: %s, IP: %s caps=0x%x cipher=%s", ch.id, shortID(sessionID), clientIP, caps, v3CipherName(chosenCipher))
+	log.Printf("[服务端] v3 客户端通道 %d 连接, 会话ID: %s, IP: %s caps=0x%x cipher=%s transport=%s", ch.id, shortID(sessionID), clientIP, caps, v3CipherName(chosenCipher), sess.Type())
 	_ = stream.SetDeadline(time.Time{})
-	_ = netConn.SetDeadline(time.Time{})
-	handleAuthenticatedSmuxSession(ch, sess)
+
+	if sess.Type() == transport.TransportTypeQUIC {
+		go handleQuicDatagrams(ch, sess)
+	}
+
+	handleAuthenticatedTransportSession(ch, sess)
 }
+
+func handleQuicDatagrams(ch *WSChannel, sess transport.TransportSession) {
+	ctx := context.Background()
+	reassembler := transport.NewDatagramReassembler(5*time.Second, 1024)
+	udpTimeout := cfg.UDPReadTimeout
+	if udpTimeout <= 0 {
+		udpTimeout = 1 * time.Second
+	}
+
+	var mu sync.Mutex
+	relayers := make(map[uint16]UDPRelayer)
+
+	defer func() {
+		mu.Lock()
+		for _, r := range relayers {
+			_ = r.Close()
+		}
+		mu.Unlock()
+	}()
+
+	for {
+		raw, err := sess.ReceiveDatagram(ctx)
+		if err != nil {
+			return
+		}
+		frame, err := transport.DecodeDatagram(raw)
+		if err != nil {
+			continue
+		}
+		fullFrame, ok, err := reassembler.Add(frame)
+		if err != nil || !ok {
+			continue
+		}
+
+		target := fmt.Sprintf("%s:%d", fullFrame.TargetAddr, fullFrame.TargetPort)
+		mu.Lock()
+		relay, exists := relayers[fullFrame.AssocID]
+		if !exists {
+			addr, errResolve := resolveUDPWithStrategy(target, IPStrategyPv4Pv6)
+			if errResolve != nil {
+				mu.Unlock()
+				continue
+			}
+			udpConn, errListen := net.ListenUDP("udp", nil)
+			if errListen != nil {
+				mu.Unlock()
+				continue
+			}
+			relay = &DirectUDPRelayer{conn: udpConn, target: addr}
+			relayers[fullFrame.AssocID] = relay
+
+			go func(assocID uint16, r UDPRelayer) {
+				buf := make([]byte, 2048)
+				for {
+					_ = r.SetReadDeadline(time.Now().Add(udpTimeout))
+					n, fromAddrStr, err := r.Read(buf)
+					if err != nil {
+						return
+					}
+					host, portStr, errSplit := net.SplitHostPort(fromAddrStr)
+					portInt := 0
+					if errSplit == nil {
+						portInt, _ = strconv.Atoi(portStr)
+					} else {
+						host = fromAddrStr
+					}
+					respFrame := transport.DatagramFrame{
+						AssocID:    assocID,
+						AddrType:   transport.AddrTypeIPv4,
+						TargetAddr: host,
+						TargetPort: uint16(portInt),
+						Payload:    buf[:n],
+					}
+					if ip := net.ParseIP(host); ip != nil {
+						if ip.To4() != nil {
+							respFrame.AddrType = transport.AddrTypeIPv4
+						} else {
+							respFrame.AddrType = transport.AddrTypeIPv6
+						}
+					} else {
+						respFrame.AddrType = transport.AddrTypeDomain
+					}
+					encoded, err := transport.EncodeDatagram(respFrame)
+					if err == nil {
+						_ = sess.SendDatagram(encoded)
+					}
+				}
+			}(fullFrame.AssocID, relay)
+		}
+		mu.Unlock()
+
+		_, _ = relay.Write(fullFrame.Payload)
+	}
+}
+
 func validateChannelInitTime(now time.Time, timestamp int64, skew time.Duration) bool {
 	if skew <= 0 {
 		return true
@@ -835,16 +1048,18 @@ func validateChannelInitTime(now time.Time, timestamp int64, skew time.Duration)
 	return !then.Before(now.Add(-skew)) && !then.After(now.Add(skew))
 }
 
-func handleAuthenticatedSmuxSession(ch *WSChannel, sess *smux.Session) {
-	wsConn := ch.conn
+func handleAuthenticatedTransportSession(ch *WSChannel, sess transport.TransportSession) {
+	closer := ch.conn
 	session := ch.session
 
 	defer func() {
-		_ = wsConn.Close()
+		if closer != nil {
+			_ = closer.Close()
+		}
 		session.removeChannel(ch.id, ch)
 	}()
 	for {
-		stream, err := sess.AcceptStream()
+		stream, err := sess.AcceptStream(context.Background())
 		if err != nil {
 			log.Printf("[服务端] 客户端通道 %d 断开", ch.id)
 			return
@@ -859,21 +1074,29 @@ func handleAuthenticatedSmuxSession(ch *WSChannel, sess *smux.Session) {
 	}
 }
 
-func handleWebSocketChannel(ch *WSChannel) {
-	netConn := newWSNetConn(ch.conn)
-	sess, err := smux.Server(netConn, newSmuxConfig())
-	if err != nil {
-		log.Printf("[服务端] 通道 %d smux 初始化失败: %v", ch.id, err)
-		_ = ch.conn.Close()
-		ch.session.removeChannel(ch.id, ch)
-		return
-	}
-	defer sess.Close()
-	handleAuthenticatedSmuxSession(ch, sess)
+func handleAuthenticatedSmuxSession(ch *WSChannel, sess *smux.Session) {
+	handleAuthenticatedTransportSession(ch, transport.NewTcpTransportSession(sess, ch.conn))
 }
 
-func rejectSmuxStreamDueToLimit(ch *WSChannel, stream *smux.Stream) {
-	defer stream.Close()
+func handleWebSocketChannel(ch *WSChannel) {
+	if ch.conn != nil {
+		netConn := newWSNetConn(ch.conn)
+		sess, err := smux.Server(netConn, newSmuxConfig())
+		if err != nil {
+			log.Printf("[服务端] 通道 %d smux 初始化失败: %v", ch.id, err)
+			_ = ch.conn.Close()
+			ch.session.removeChannel(ch.id, ch)
+			return
+		}
+		defer sess.Close()
+		handleAuthenticatedSmuxSession(ch, sess)
+	}
+}
+
+func rejectSmuxStreamDueToLimit(ch *WSChannel, stream any) {
+	if closer, ok := stream.(io.Closer); ok {
+		defer closer.Close()
+	}
 	cStream, err := wrapV3DataStream(ch, stream)
 	if err != nil {
 		return
@@ -916,13 +1139,17 @@ func openStatusCodeName(code byte) string {
 }
 
 func formatOpenStatusError(status byte, code byte, message string) string {
-	if message == "" {
-		message = fmt.Sprintf("status=%d", status)
-	}
 	if code == openStatusCodeNone {
+		if message == "" {
+			return fmt.Sprintf("status=%d", status)
+		}
 		return message
 	}
-	return fmt.Sprintf("%s: %s", openStatusCodeName(code), message)
+	codeName := openStatusCodeName(code)
+	if message == "" {
+		return codeName
+	}
+	return fmt.Sprintf("%s: %s", codeName, message)
 }
 
 type remoteOpenError struct {
@@ -979,11 +1206,12 @@ func httpStatusForOpenError(err error) int {
 	}
 	return http.StatusBadGateway
 }
-
-func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream) {
+func handleSmuxStream(session *ClientSession, ch *WSChannel, stream any) {
 	defer func() {
 		session.releaseStream()
-		stream.Close()
+		if closer, ok := stream.(io.Closer); ok {
+			_ = closer.Close()
+		}
 	}()
 	cStream, err := wrapV3DataStream(ch, stream)
 	if err != nil {

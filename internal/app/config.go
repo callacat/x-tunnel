@@ -162,6 +162,11 @@ var (
 	shapingCoalesceMs    int
 	configuredCipherPref []byte
 
+	transportMode  string
+	quicPort       int
+	enableDatagram bool
+	coverTraffic   bool
+
 	echListMu sync.RWMutex
 	echList   []byte
 	refreshMu sync.Mutex
@@ -254,6 +259,10 @@ func init() {
 	flag.StringVar(&cipherPrefStr, "cipher-pref", "1,2,3", "客户端 v3 cipher 偏好列表（逗号分隔的算法 ID，如 1,2,3）")
 	flag.Float64Var(&pacingRateMbps, "pacing-rate-mbps", 0, "客户端发送端 pacing 速率 (Mbps，0 表示禁用)")
 	flag.IntVar(&shapingCoalesceMs, "shaping-coalesce-ms", 0, "客户端小包合并延迟上限 (毫秒，0 表示禁用合并)")
+	flag.StringVar(&transportMode, "transport", "auto", "传输层模式 (auto: 优先 QUIC 自动回退 TCP/WSS | quic: 仅 QUIC | tcp: 仅 TCP/WSS)")
+	flag.IntVar(&quicPort, "quic-port", 0, "服务端 QUIC 独立监听端口 (0 表示复用主监听端口的 UDP)")
+	flag.BoolVar(&enableDatagram, "enable-datagram", true, "是否启用 RFC 9221 QUIC Datagram 进行原生 UDP 代理")
+	flag.BoolVar(&coverTraffic, "cover-traffic", false, "是否启用连接空闲时的 cover traffic 拟形混淆")
 	flag.IntVar(&connectionNum, "n", 3, "每个IP建立的WebSocket连接数量")
 	flag.StringVar(&ips, "ips", "", "服务端解析目标地址的IP偏好 (仅客户端有效)\n 4: 仅IPv4\n 6: 仅IPv6\n 4,6: IPv4优先\n 6,4: IPv6优先")
 	flag.StringVar(&controlAddr, "control", "", "可选本地控制 API 监听地址，如 127.0.0.1:0")
@@ -321,6 +330,14 @@ type FileConfig struct {
 	PacingRateMbpsFlag    *float64                   `json:"pacing-rate-mbps"`
 	ShapingCoalesceMs     *int                       `json:"shaping_coalesce_ms"`
 	ShapingCoalesceMsFlag *int                       `json:"shaping-coalesce-ms"`
+	Transport             *string                    `json:"transport"`
+	TransportFlag         *string                    `json:"transport_mode"`
+	QuicPort              *int                       `json:"quic_port"`
+	QuicPortFlag          *int                       `json:"quic-port"`
+	EnableDatagram        *bool                      `json:"enable_datagram"`
+	EnableDatagramFlag    *bool                      `json:"enable-datagram"`
+	CoverTraffic          *bool                      `json:"cover_traffic"`
+	CoverTrafficFlag      *bool                      `json:"cover-traffic"`
 	WebSocketFrontProxy   *WebSocketFrontProxyConfig `json:"websocket_front_proxy"`
 	DialTimeout           *string                    `json:"dial_timeout"`
 	WSHandshakeTimeout    *string                    `json:"ws_handshake_timeout"`
@@ -375,6 +392,10 @@ type runtimeValues struct {
 	CipherPref          string
 	PacingRateMbps      float64
 	ShapingCoalesceMs   int
+	TransportMode       string
+	QuicPort            int
+	EnableDatagram      bool
+	CoverTraffic        bool
 	Global              GlobalConfig
 	WebSocketFrontProxy WebSocketFrontProxyConfig
 }
@@ -415,6 +436,10 @@ func currentRuntimeValues() runtimeValues {
 		CipherPref:          cipherPrefStr,
 		PacingRateMbps:      pacingRateMbps,
 		ShapingCoalesceMs:   shapingCoalesceMs,
+		TransportMode:       transportMode,
+		QuicPort:            quicPort,
+		EnableDatagram:      enableDatagram,
+		CoverTraffic:        coverTraffic,
 		Global:              cfg,
 		WebSocketFrontProxy: cloneWebSocketFrontProxyConfig(websocketFrontProxyConfig),
 	}
@@ -432,6 +457,10 @@ func defaultRuntimeValues() runtimeValues {
 		CipherPref:        "1,2,3",
 		PacingRateMbps:    0,
 		ShapingCoalesceMs: 0,
+		TransportMode:     "auto",
+		QuicPort:          0,
+		EnableDatagram:    true,
+		CoverTraffic:      false,
 		Global:            defaultGlobalConfig(),
 	}
 }
@@ -465,6 +494,10 @@ func (values runtimeValues) applyGlobals() {
 	cipherPrefStr = values.CipherPref
 	pacingRateMbps = values.PacingRateMbps
 	shapingCoalesceMs = values.ShapingCoalesceMs
+	transportMode = values.TransportMode
+	quicPort = values.QuicPort
+	enableDatagram = values.EnableDatagram
+	coverTraffic = values.CoverTraffic
 	cfg = values.Global
 	websocketFrontProxyConfig = cloneWebSocketFrontProxyConfig(values.WebSocketFrontProxy)
 }
@@ -548,6 +581,10 @@ func normalizeConfigFieldAliases(fields map[string]json.RawMessage) {
 		"cipher-pref":         "cipher_pref",
 		"pacing-rate-mbps":    "pacing_rate_mbps",
 		"shaping-coalesce-ms": "shaping_coalesce_ms",
+		"transport-mode":      "transport",
+		"quic-port":           "quic_port",
+		"enable-datagram":     "enable_datagram",
+		"cover-traffic":       "cover_traffic",
 	}
 	for alias, canonical := range aliases {
 		if value, ok := fields[alias]; ok {
@@ -636,6 +673,22 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	if err != nil {
 		return err
 	}
+	transportVal, err := singleStringConfigAlias("transport", "transport_mode", fc.Transport, fc.TransportFlag)
+	if err != nil {
+		return err
+	}
+	quicPortVal, err := singleIntConfigAlias("quic_port", "quic-port", fc.QuicPort, fc.QuicPortFlag)
+	if err != nil {
+		return err
+	}
+	enableDatagramVal, err := singleBoolConfigAlias("enable_datagram", "enable-datagram", fc.EnableDatagram, fc.EnableDatagramFlag)
+	if err != nil {
+		return err
+	}
+	coverTrafficVal, err := singleBoolConfigAlias("cover_traffic", "cover-traffic", fc.CoverTraffic, fc.CoverTrafficFlag)
+	if err != nil {
+		return err
+	}
 	applyStringConfig(seen, "l", fc.Listen, &values.ListenAddr)
 	applyStringConfig(seen, "f", fc.Forward, &values.ForwardAddr)
 	applyStringConfig(seen, "ip", fc.IP, &values.IPAddr)
@@ -679,6 +732,16 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	}
 	if fc.Fallback != nil && !seen["fallback"] {
 		values.Fallback = *fc.Fallback
+	}
+	applyStringConfig(seen, "transport", transportVal, &values.TransportMode)
+	if err := applyNonNegativeIntConfig(seen, "quic-port", quicPortVal, &values.QuicPort); err != nil {
+		return err
+	}
+	if enableDatagramVal != nil && !seen["enable-datagram"] {
+		values.EnableDatagram = *enableDatagramVal
+	}
+	if coverTrafficVal != nil && !seen["cover-traffic"] {
+		values.CoverTraffic = *coverTrafficVal
 	}
 	if fc.WebSocketFrontProxy != nil {
 		values.WebSocketFrontProxy = cloneWebSocketFrontProxyConfig(*fc.WebSocketFrontProxy)
@@ -745,6 +808,16 @@ func singleIntConfigAlias(primaryName, aliasName string, primary, alias *int) (*
 }
 
 func singleFloat64ConfigAlias(primaryName, aliasName string, primary, alias *float64) (*float64, error) {
+	if primary != nil && alias != nil {
+		return nil, fmt.Errorf("配置字段 %q 和 %q 不能同时设置", primaryName, aliasName)
+	}
+	if primary != nil {
+		return primary, nil
+	}
+	return alias, nil
+}
+
+func singleBoolConfigAlias(primaryName, aliasName string, primary, alias *bool) (*bool, error) {
 	if primary != nil && alias != nil {
 		return nil, fmt.Errorf("配置字段 %q 和 %q 不能同时设置", primaryName, aliasName)
 	}
@@ -1221,6 +1294,11 @@ func validateStartupConfigValues(values runtimeValues) (*startupConfig, error) {
 	}
 	if values.ShapingCoalesceMs < 0 {
 		return nil, fmt.Errorf("-shaping-coalesce-ms 不能小于 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(values.TransportMode)) {
+	case "", "auto", "quic", "tcp":
+	default:
+		return nil, fmt.Errorf("无效的 transport 模式 %q，仅支持 auto/quic/tcp", values.TransportMode)
 	}
 	parsedCipherPref, err := parseCipherPreference(values.CipherPref)
 	if err != nil {
