@@ -27,6 +27,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/xtaci/smux"
+
+	"x-tunnel/internal/transport"
 )
 
 func TestParseIPStrategy(t *testing.T) {
@@ -288,6 +290,59 @@ func TestWriteMetrics(t *testing.T) {
 		"x_tunnel_client_channel_up{channel=\"2\"} 0",
 		"x_tunnel_client_channel_rtt_seconds{channel=\"2\"} 0.000000000",
 		"x_tunnel_client_channel_capabilities{channel=\"2\"} 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("metrics output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// stubTransportSession 模拟非 TCP（如 QUIC）的 transport.TransportSession，
+// 用于验证客户端通道指标不依赖 smuxConns。
+type stubTransportSession struct {
+	closed atomic.Bool
+}
+
+func (s *stubTransportSession) Type() transport.TransportType { return transport.TransportTypeQUIC }
+func (s *stubTransportSession) OpenStream(context.Context) (transport.TransportStream, error) {
+	return nil, errors.New("stub")
+}
+func (s *stubTransportSession) AcceptStream(context.Context) (transport.TransportStream, error) {
+	return nil, errors.New("stub")
+}
+func (s *stubTransportSession) SendDatagram([]byte) error { return errors.New("stub") }
+func (s *stubTransportSession) ReceiveDatagram(context.Context) ([]byte, error) {
+	return nil, errors.New("stub")
+}
+func (s *stubTransportSession) LocalAddr() net.Addr  { return nil }
+func (s *stubTransportSession) RemoteAddr() net.Addr { return nil }
+func (s *stubTransportSession) IsClosed() bool       { return s.closed.Load() }
+func (s *stubTransportSession) Close() error {
+	s.closed.Store(true)
+	return nil
+}
+
+func TestWriteClientChannelMetricsTransportSessionUp(t *testing.T) {
+	live := &stubTransportSession{}
+	closed := &stubTransportSession{}
+	closed.closed.Store(true)
+	// QUIC 通道的 smuxConns 槽位为 nil，生命周期由 transportSessions 承载。
+	pool := &ECHPool{
+		transportSessions: []transport.TransportSession{live, closed, nil},
+		smuxConns:         []*smux.Session{nil, nil, nil},
+		channelRTT:        []int64{int64(10 * time.Millisecond), 0, 0},
+		channelCaps:       []uint64{4735, 4735, 0},
+	}
+
+	var buf bytes.Buffer
+	writeClientChannelMetrics(&buf, pool)
+	got := buf.String()
+	for _, want := range []string{
+		`x_tunnel_client_channel_up{channel="1"} 1`,
+		`x_tunnel_client_channel_up{channel="2"} 0`,
+		`x_tunnel_client_channel_up{channel="3"} 0`,
+		`x_tunnel_client_channel_rtt_seconds{channel="1"} 0.010000000`,
+		`x_tunnel_client_channel_capabilities{channel="1"} 4735`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("metrics output missing %q:\n%s", want, got)

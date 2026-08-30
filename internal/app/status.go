@@ -268,7 +268,9 @@ func snapshotClientChannels(pool *ECHPool) []ClientChannelStatus {
 	defer pool.wsConnsMu.RUnlock()
 	out := make([]ClientChannelStatus, 0, len(pool.channelRTT))
 	for i := range pool.channelRTT {
-		up := i < len(pool.smuxConns) && pool.smuxConns[i] != nil && !pool.smuxConns[i].IsClosed()
+		sessUp := i < len(pool.transportSessions) && pool.transportSessions[i] != nil && !pool.transportSessions[i].IsClosed()
+		smuxUp := i < len(pool.smuxConns) && pool.smuxConns[i] != nil && !pool.smuxConns[i].IsClosed()
+		up := sessUp || smuxUp
 		var caps uint64
 		if i < len(pool.channelCaps) {
 			caps = pool.channelCaps[i]

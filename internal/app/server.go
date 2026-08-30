@@ -518,7 +518,9 @@ func writeClientChannelMetrics(w io.Writer, pool *ECHPool) {
 	defer pool.wsConnsMu.RUnlock()
 	for i := range pool.channelRTT {
 		up := 0
-		if i < len(pool.smuxConns) && pool.smuxConns[i] != nil && !pool.smuxConns[i].IsClosed() {
+		sessUp := i < len(pool.transportSessions) && pool.transportSessions[i] != nil && !pool.transportSessions[i].IsClosed()
+		smuxUp := i < len(pool.smuxConns) && pool.smuxConns[i] != nil && !pool.smuxConns[i].IsClosed()
+		if sessUp || smuxUp {
 			up = 1
 		}
 		var caps uint64
