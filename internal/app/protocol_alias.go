@@ -133,16 +133,16 @@ func computeV3SharedSecret(ephSk, peerPk []byte) ([]byte, error) {
 	return wire.ComputeV3SharedSecret(ephSk, peerPk)
 }
 
-func computeV3TranscriptHash(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte, full bool) ([]byte, error) {
-	return wire.ComputeV3TranscriptHash(serverName, path, init, serverEphPK, negotiatedCipher, full)
+func computeV3TranscriptHash(serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte, full bool) ([]byte, error) {
+	return wire.ComputeV3TranscriptHash(serverName, path, init, serverEphPK, serverNonce, negotiatedCipher, full)
 }
 
 func computeV3TranscriptHashInit(serverName, path string, init ChannelInit) ([]byte, error) {
 	return wire.ComputeV3TranscriptHashInit(serverName, path, init)
 }
 
-func computeV3TranscriptHashFull(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte) ([]byte, error) {
-	return wire.ComputeV3TranscriptHashFull(serverName, path, init, serverEphPK, negotiatedCipher)
+func computeV3TranscriptHashFull(serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte) ([]byte, error) {
+	return wire.ComputeV3TranscriptHashFull(serverName, path, init, serverEphPK, serverNonce, negotiatedCipher)
 }
 
 func computeV3AuthProof(token, serverName, path string, init ChannelInit) ([]byte, error) {
@@ -153,8 +153,8 @@ func verifyV3AuthProof(token, serverName, path string, init ChannelInit) bool {
 	return wire.VerifyV3AuthProof(token, serverName, path, init)
 }
 
-func computeV3ServerProof(token, serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte) ([]byte, error) {
-	return wire.ComputeV3ServerProof(token, serverName, path, init, serverEphPK, negotiatedCipher)
+func computeV3ServerProof(token, serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte) ([]byte, error) {
+	return wire.ComputeV3ServerProof(token, serverName, path, init, serverEphPK, serverNonce, negotiatedCipher)
 }
 
 func verifyV3ServerProof(token, serverName, path string, init ChannelInit, accept ChannelAccept) bool {

@@ -568,7 +568,7 @@ func WriteChannelRejectV3(w io.Writer, reject ChannelReject) error {
 	return writeChannelRejectV3(w, reject)
 }
 
-func channelInitTranscriptV3(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte, full bool) ([]byte, error) {
+func channelInitTranscriptV3(serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte, full bool) ([]byte, error) {
 	if len(init.SessionID) != 16 {
 		return nil, fmt.Errorf("session id must be 16 bytes")
 	}
@@ -587,6 +587,9 @@ func channelInitTranscriptV3(serverName, path string, init ChannelInit, serverEp
 	if full {
 		if len(serverEphPK) != 32 {
 			return nil, fmt.Errorf("server ephemeral public key must be 32 bytes")
+		}
+		if len(serverNonce) != 32 {
+			return nil, fmt.Errorf("server nonce must be 32 bytes")
 		}
 		if !isSupportedCipherV3(negotiatedCipher) {
 			return nil, fmt.Errorf("unsupported cipher in transcript: %d", negotiatedCipher)
@@ -609,7 +612,7 @@ func channelInitTranscriptV3(serverName, path string, init ChannelInit, serverEp
 
 	total := 137 + len(init.CipherPref) + 2 + len(serverName) + 2 + len(path) + 12
 	if full {
-		total += 1
+		total += 1 + 32
 	}
 	buf := make([]byte, total)
 	buf[0] = 0x01 // ChannelInit frame type
@@ -640,15 +643,18 @@ func channelInitTranscriptV3(serverName, path string, init ChannelInit, serverEp
 	off += 12
 	if full {
 		buf[off] = negotiatedCipher
+		off++
+		copy(buf[off:off+32], serverNonce)
+		off += 32
 	}
 	return buf, nil
 }
 
 // ComputeV3TranscriptHash computes the SHA256 hash of the v3 handshake transcript.
 // When full is false, it computes transcript_hash_init (with server_eph_pk as 32 zeros, without negotiated cipher).
-// When full is true, it computes transcript_hash_full (with real server_eph_pk and negotiated cipher appended).
-func ComputeV3TranscriptHash(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte, full bool) ([]byte, error) {
-	transcript, err := channelInitTranscriptV3(serverName, path, init, serverEphPK, negotiatedCipher, full)
+// When full is true, it computes transcript_hash_full (with real server_eph_pk, negotiated cipher, and server_nonce appended).
+func ComputeV3TranscriptHash(serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte, full bool) ([]byte, error) {
+	transcript, err := channelInitTranscriptV3(serverName, path, init, serverEphPK, serverNonce, negotiatedCipher, full)
 	if err != nil {
 		return nil, err
 	}
@@ -658,12 +664,12 @@ func ComputeV3TranscriptHash(serverName, path string, init ChannelInit, serverEp
 
 // ComputeV3TranscriptHashInit computes transcript_hash_init used for auth_proof computation and verification.
 func ComputeV3TranscriptHashInit(serverName, path string, init ChannelInit) ([]byte, error) {
-	return ComputeV3TranscriptHash(serverName, path, init, nil, 0, false)
+	return ComputeV3TranscriptHash(serverName, path, init, nil, nil, 0, false)
 }
 
 // ComputeV3TranscriptHashFull computes transcript_hash_full used for server_proof and session key derivation.
-func ComputeV3TranscriptHashFull(serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte) ([]byte, error) {
-	return ComputeV3TranscriptHash(serverName, path, init, serverEphPK, negotiatedCipher, true)
+func ComputeV3TranscriptHashFull(serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte) ([]byte, error) {
+	return ComputeV3TranscriptHash(serverName, path, init, serverEphPK, serverNonce, negotiatedCipher, true)
 }
 
 // ComputeV3AuthProof computes the HMAC-SHA256 authentication proof for v3 ChannelInit over transcript_hash_init.
@@ -695,8 +701,8 @@ func VerifyV3AuthProof(token, serverName, path string, init ChannelInit) bool {
 }
 
 // ComputeV3ServerProof computes the HMAC-SHA256 server proof over transcript_hash_full.
-func ComputeV3ServerProof(token, serverName, path string, init ChannelInit, serverEphPK []byte, negotiatedCipher byte) ([]byte, error) {
-	transcriptHash, err := ComputeV3TranscriptHashFull(serverName, path, init, serverEphPK, negotiatedCipher)
+func ComputeV3ServerProof(token, serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte) ([]byte, error) {
+	transcriptHash, err := ComputeV3TranscriptHashFull(serverName, path, init, serverEphPK, serverNonce, negotiatedCipher)
 	if err != nil {
 		return nil, err
 	}
@@ -712,7 +718,7 @@ func ComputeV3ServerProof(token, serverName, path string, init ChannelInit, serv
 
 // VerifyV3ServerProof verifies the server proof in constant time against the expected HMAC-SHA256 over transcript_hash_full.
 func VerifyV3ServerProof(token, serverName, path string, init ChannelInit, accept ChannelAccept) bool {
-	expected, err := ComputeV3ServerProof(token, serverName, path, init, accept.ServerEphPK, accept.Cipher)
+	expected, err := ComputeV3ServerProof(token, serverName, path, init, accept.ServerEphPK, accept.ServerNonce, accept.Cipher)
 	if err != nil {
 		return false
 	}
@@ -740,8 +746,16 @@ func DeriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3Ses
 	if len(shared) != 32 {
 		return V3SessionKeys{}, fmt.Errorf("shared secret must be 32 bytes")
 	}
+	if isZeroBytesV3(shared) {
+		return V3SessionKeys{}, fmt.Errorf("shared secret must not be all zero")
+	}
 
-	prk := hkdf.Extract(sha256.New, []byte(token), []byte("xtunnel-v3-kdf"))
+	// The DH shared secret is secret input keying material and must enter via
+	// HKDF-Extract (ikm = shared || token), not mere Expand info.
+	ikm := make([]byte, 0, len(shared)+len(token))
+	ikm = append(ikm, shared...)
+	ikm = append(ikm, token...)
+	prk := hkdf.Extract(sha256.New, ikm, []byte("xtunnel-v3-kdf"))
 
 	seedReader := hkdf.Expand(sha256.New, prk, transcriptHashFull)
 	seed := make([]byte, 32)
@@ -749,11 +763,7 @@ func DeriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3Ses
 		return V3SessionKeys{}, err
 	}
 
-	sessionSeedInfo := make([]byte, len("xtunnel-v3 fs mix")+len(shared))
-	copy(sessionSeedInfo, "xtunnel-v3 fs mix")
-	copy(sessionSeedInfo[len("xtunnel-v3 fs mix"):], shared)
-
-	sessionSeedReader := hkdf.Expand(sha256.New, seed, sessionSeedInfo)
+	sessionSeedReader := hkdf.Expand(sha256.New, seed, []byte("xtunnel-v3 fs mix"))
 	sessionSeed := make([]byte, 32)
 	if _, err := io.ReadFull(sessionSeedReader, sessionSeed); err != nil {
 		return V3SessionKeys{}, err
@@ -778,9 +788,21 @@ func DeriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3Ses
 	}, nil
 }
 
-// DeriveV3SessionKeys is a compatibility wrapper around DeriveV3SessionSeed with zero shared secret.
+// DeriveV3SessionKeys is a deprecated compatibility wrapper that historically
+// derived keys with an all-zero shared secret, silently disabling forward
+// secrecy. It now always fails; use DeriveV3SessionSeed with a real X25519
+// shared secret instead.
 func DeriveV3SessionKeys(token string, transcriptHash []byte) (V3SessionKeys, error) {
-	return DeriveV3SessionSeed(token, transcriptHash, make([]byte, 32))
+	return V3SessionKeys{}, fmt.Errorf("DeriveV3SessionKeys is disabled: a non-zero DH shared secret is required, use DeriveV3SessionSeed")
+}
+
+// isZeroBytesV3 reports whether b is entirely zero bytes.
+func isZeroBytesV3(b []byte) bool {
+	var or byte
+	for _, v := range b {
+		or |= v
+	}
+	return or == 0
 }
 
 // StreamKey derives a directional stream AEAD key for a specific cipher, stream ID, and generation.

@@ -10,7 +10,7 @@ import (
 // testV3StreamKeys returns deterministic session keys for cipher stream tests.
 func testV3StreamKeys(t *testing.T) V3SessionKeys {
 	t.Helper()
-	thFull, err := ComputeV3TranscriptHashFull("edge.example.com", "/tunnel", fixedChannelInitV3(), fixedTestServerPk(), ProtocolCipherChaCha20Poly1305)
+	thFull, err := ComputeV3TranscriptHashFull("edge.example.com", "/tunnel", fixedChannelInitV3(), fixedTestServerPk(), fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	if err != nil {
 		t.Fatalf("ComputeV3TranscriptHashFull error: %v", err)
 	}

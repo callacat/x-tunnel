@@ -867,7 +867,17 @@ func handlePreAuthTransportSession(sess transport.TransportSession, closer io.Cl
 		return
 	}
 
-	thFull, err := computeV3TranscriptHashFull(serverName, path, init, serverPk, chosenCipher)
+	serverNonce := make([]byte, 32)
+	if _, err := rand.Read(serverNonce); err != nil {
+		atomic.AddUint64(&serverProtocolFailureSeq, 1)
+		if closer != nil {
+			_ = closer.Close()
+		}
+		log.Printf("[服务端] v3 生成服务端 nonce 失败: %v", err)
+		return
+	}
+
+	thFull, err := computeV3TranscriptHashFull(serverName, path, init, serverPk, serverNonce, chosenCipher)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		if closer != nil {
@@ -877,7 +887,7 @@ func handlePreAuthTransportSession(sess transport.TransportSession, closer io.Cl
 		return
 	}
 
-	serverProof, err := computeV3ServerProof(token, serverName, path, init, serverPk, chosenCipher)
+	serverProof, err := computeV3ServerProof(token, serverName, path, init, serverPk, serverNonce, chosenCipher)
 	if err != nil {
 		atomic.AddUint64(&serverProtocolFailureSeq, 1)
 		if closer != nil {
@@ -906,16 +916,6 @@ func handlePreAuthTransportSession(sess transport.TransportSession, closer io.Cl
 	ch.v3Cipher = chosenCipher
 	ch.transport = sess
 
-	serverNonce := make([]byte, 32)
-	if _, err := rand.Read(serverNonce); err != nil {
-		atomic.AddUint64(&serverProtocolFailureSeq, 1)
-		session.removeChannel(ch.id, ch)
-		if closer != nil {
-			_ = closer.Close()
-		}
-		log.Printf("[服务端] v3 生成服务端 nonce 失败: %v", err)
-		return
-	}
 	accept := ChannelAccept{
 		Capabilities: caps,
 		ServerNonce:  serverNonce,
