@@ -29,6 +29,31 @@ const (
 	dnsRCodeMask = 0x000f
 )
 
+// sniffDNSQuery 从 DNS 查询报文提取首个问题的 QNAME（仅标准查询 QR=0）。
+// round43 DNS 源分流用：按查询域名决定走国内 DNS 直连还是隧道境外解析。
+func sniffDNSQuery(payload []byte) (string, bool) {
+	if len(payload) < dnsHeaderLen {
+		return "", false
+	}
+	flags := binary.BigEndian.Uint16(payload[2:4])
+	if flags&dnsFlagQR != 0 { // 响应报文，不是查询
+		return "", false
+	}
+	qdcount := int(binary.BigEndian.Uint16(payload[4:6]))
+	if qdcount == 0 {
+		return "", false
+	}
+	name, _, ok := parseDNSName(payload, dnsHeaderLen)
+	if !ok {
+		return "", false
+	}
+	qname := strings.TrimSuffix(name, ".")
+	if qname == "" || qname == "." {
+		return "", false
+	}
+	return qname, true
+}
+
 // sniffDNSAnswers 从 DNS 响应报文中提取 (qname, ips)——问题 QNAME + 答案里的 A/AAAA IP。
 // 返回的 ips 供 routeRT.remember 写入 IP→域名映射。不合规返回 ("" , nil)。
 func sniffDNSAnswers(payload []byte) (string, []netip.Addr) {

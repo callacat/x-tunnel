@@ -29,6 +29,14 @@ const (
 	DefaultGeoIPURL   = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat"
 )
 
+// round43：GitHub 加速镜像（东哥建议，2026-08-30）。
+// 镜像站国内直连可达——不开代理也能更新 GEO 库。下载顺序：
+// 镜像直连优先 → 原始 URL 兜底（走隧道代理，见 SetDownloadProxy）。
+var geoMirrors = []string{
+	"https://gh-proxy.org/",
+	"https://gh-proxy.com/",
+}
+
 // DefaultRulesURL 是仓库内置默认规则文件（rules/default-rules.txt）的 raw 地址。
 // 首次启动时优先从这里拉取最新规则模板，下载失败回退内置 DefaultRules。
 const DefaultRulesURL = "https://raw.githubusercontent.com/callacat/warp-go/main/rules/default-rules.txt"
@@ -43,6 +51,10 @@ const (
 // 默认直连；SetDownloadProxy 可注入 SOCKS5 代理客户端（Android sidecar 场景）。
 var updateHTTPClient = &http.Client{}
 
+// directHTTPClient 是镜像直连专用客户端（不随 SetDownloadProxy 注入代理——
+// 加速镜像本身国内可达，直连即可，不占隧道带宽）。
+var directHTTPClient = &http.Client{}
+
 // SetDownloadProxy 注入 GEO 下载用的 HTTP 客户端。Android 端 sidecar 直连
 // 物理网络在境内拉 GitHub 必败（round39 真机实锤：GEO 库永远下载不下来），
 // 需要改走本机 SOCKS5 listener（隧道出口）下载。传 nil 恢复默认直连。
@@ -52,6 +64,62 @@ func SetDownloadProxy(client *http.Client) {
 		return
 	}
 	updateHTTPClient = client
+}
+
+// downloadWithMirrors 按「镜像直连 → 原始 URL（代理）」顺序拉取：
+//  1. 每个加速镜像 + 原始 URL 前缀拼接，直连尝试（镜像国内可达，不开代理也能更新）
+//  2. 全部镜像失败后用原始 URL 走 updateHTTPClient（可能注入了隧道代理）兜底
+//
+// 返回先成功那一次的数据；全败返回最后一次错误。
+func downloadWithMirrors(ctx context.Context, rawURL string) ([]byte, error) {
+	var lastErr error
+	for _, m := range geoMirrors {
+		if m == "" {
+			continue
+		}
+		data, err := fetch(ctx, directHTTPClient, m+rawURL)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+	}
+	// 原始 URL 兜底（客户端可能带隧道代理）。
+	data, err := fetch(ctx, updateHTTPClient, rawURL)
+	if err != nil {
+		if lastErr != nil {
+			return nil, fmt.Errorf("%w（镜像亦失败：%v）", err, lastErr)
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// fetch 是单次 HTTP GET（download 的无代理语义版本）。
+func fetch(ctx context.Context, client *http.Client, url string) ([]byte, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, geoDownloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("构造下载请求 %s 失败：%w", url, err)
+	}
+	// 显式声明 UA：GitHub release 下载对默认 Go UA 偶有限流。
+	req.Header.Set("User-Agent", "warp-go/route (geodata updater)")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("下载 %s 失败：%w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("下载 %s 失败：HTTP %s", url, resp.Status)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, geoMaxBytes))
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s 响应体失败：%w", url, err)
+	}
+	return data, nil
 }
 
 // UpdateGeoData 更新 GEO 数据库：下载 siteURL 与 ipURL 两个文件到 geoDir，
@@ -96,7 +164,8 @@ func UpdateGeoData(ctx context.Context, geoDir string, siteURL, ipURL string) (b
 
 // updateOne 下载单个 GEO 文件并落盘，返回是否实际更新。
 func updateOne(ctx context.Context, geoDir, url, dst string, validate func([]byte) error) (bool, error) {
-	data, err := download(ctx, url)
+	// round43：镜像直连优先（gh-proxy.org/com），原始 URL（代理客户端）兜底。
+	data, err := downloadWithMirrors(ctx, url)
 	if err != nil {
 		return false, err
 	}
@@ -121,34 +190,6 @@ func updateOne(ctx context.Context, geoDir, url, dst string, validate func([]byt
 	}
 	log.Printf("✓ %s 已更新（%d 字节）", filepath.Base(dst), len(data))
 	return true, nil
-}
-
-// download 拉取 url 的完整内容。context 取消/超时即中止。
-func download(ctx context.Context, url string) ([]byte, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, geoDownloadTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("构造下载请求 %s 失败：%w", url, err)
-	}
-	// 显式声明 UA：GitHub release 下载对默认 Go UA 偶有限流。
-	req.Header.Set("User-Agent", "warp-go/route (geodata updater)")
-
-	resp, err := updateHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("下载 %s 失败：%w", url, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("下载 %s 失败：HTTP %s", url, resp.Status)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, geoMaxBytes))
-	if err != nil {
-		return nil, fmt.Errorf("读取 %s 响应体失败：%w", url, err)
-	}
-	return data, nil
 }
 
 // validateGeoSite 校验数据能解码为 GeoSiteList。

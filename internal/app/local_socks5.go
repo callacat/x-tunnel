@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,15 @@ import (
 	"time"
 
 	"github.com/xtaci/smux"
+)
+
+// round43：DNS 源分流的两个解析出口。
+// tunnelDNSHost 境外域名走隧道解析（境外视角无污染）；directDNSHost 国内
+// 域名直连解析（国内 CDN 视角）。与 Android VpnDataPathController 的
+// GEO_DNS(223.5.5.5) 对应。
+const (
+	tunnelDNSHost = "1.1.1.1"
+	directDNSHost = "223.5.5.5"
 )
 
 type ProxyConfig struct {
@@ -429,10 +439,34 @@ func (a *UDPAssociation) loop() {
 }
 
 func (a *UDPAssociation) send(target string, data []byte) {
+	// round43：DNS 源分流（根治 DNS 污染，对齐 warp-go 阶段12）。目标 :53 的
+	// DNS 查询先解出 QNAME，按域名规则判定解析源：
+	//   - 国内域名（route→direct）→ 223.5.5.5 直连解析（国内 CDN 视角，快）
+	//   - 其余/境外域名 → **改写目标为 1.1.1.1:53 走隧道**（境外解析视角，
+	//     无污染）——r42 实锤：全部用国内 DNS 时境外域名拿到污染 IP，
+	//     geoip:cn 误判直连 → GFW 假证书（「部分外网提示不安全」根因）
+	//   - 非端口 53 的 UDP → 按 IP 分流判定（round41 语义）
+	host, portStr, _ := net.SplitHostPort(target)
+	if portStr == "53" && routeRT.engineSnapshot() != nil {
+		if qname, ok := sniffDNSQuery(data); ok {
+			if decideForTarget(qname, netip.Addr{}) != routeDirect {
+				// 境外域名：改写 DNS 目标走隧道（保留客户端原目标的响应语义
+				// 由 DNS 报文自身保证——问什么答什么，目标 IP 只是承载）。
+				rewritten := net.JoinHostPort(tunnelDNSHost, "53")
+				if rewritten != target {
+					target = rewritten
+					host = tunnelDNSHost
+				}
+			} else if host != directDNSHost {
+				// 国内域名但上游没指国内 DNS（如全局模式 1.1.1.1）：改直连解析。
+				target = net.JoinHostPort(directDNSHost, "53")
+				host = directDNSHost
+			}
+		}
+	}
 	// round41：UDP 分流判定。GEO 引擎启用且目标判定 direct（国内 DNS/国内 UDP
 	// 服务）→ 本机 socket 直发（不占隧道）；其余/引擎未启用 → 走隧道（现状）。
 	// DNS 响应同样会在 direct 路径上被嗅探（写 IP→域名映射）。
-	host, _, _ := net.SplitHostPort(target)
 	routeHost, routeIP := routeRT.resolveHostForRoute(host)
 	if decideForTarget(routeHost, routeIP) == routeDirect {
 		a.sendDirect(target, data)
