@@ -55,6 +55,39 @@ func nextClientTAI64N() []byte {
 	return encodeTAI64N(time.Unix(0, now))
 }
 
+// clientAuthHintThreshold is the number of consecutive handshake failures
+// after which the client logs a hint that the token may be wrong or the
+// protocol incompatible. Retries stay silent up to the threshold, and the
+// server-side silent-drop behavior is unchanged.
+const clientAuthHintThreshold = 5
+
+// clientAuthFailureHint returns a user-visible hint message when the given
+// consecutive handshake failure count hits the threshold (or a multiple of
+// it), and an empty string otherwise.
+func clientAuthFailureHint(consecutiveFailures int) string {
+	if consecutiveFailures > 0 && consecutiveFailures%clientAuthHintThreshold == 0 {
+		return fmt.Sprintf("已连续 %d 次握手失败，可能是 token 错误或协议不兼容（请检查 token 与服务端版本）", consecutiveFailures)
+	}
+	return ""
+}
+
+// clientHandshakeFailureTracker counts consecutive handshake failures for one
+// channel. It is reset on success.
+type clientHandshakeFailureTracker struct {
+	consecutive int
+}
+
+// recordFailure increments the failure count and reports whether the hint
+// threshold has been hit.
+func (t *clientHandshakeFailureTracker) recordFailure() bool {
+	t.consecutive++
+	return t.consecutive%clientAuthHintThreshold == 0
+}
+
+// recordSuccess resets the consecutive failure count.
+func (t *clientHandshakeFailureTracker) recordSuccess() {
+	t.consecutive = 0
+}
 
 type ECHPool struct {
 	wsServerAddr  string
@@ -132,6 +165,7 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		ipLabel = "自动解析"
 	}
 	reconnectAttempt := 0
+	var hsTracker clientHandshakeFailureTracker
 	sleepBeforeReconnect := func(reason string) bool {
 		delay := reconnectDelay(reconnectAttempt)
 		atomic.AddUint64(&clientReconnectSeq, 1)
@@ -212,6 +246,9 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		caps, keys, cipher, err := negotiateClientProtocol(sess, cfg.RTTProbeTimeout, p.clientID, uint32(chID), p.wsServerAddr)
 		if err != nil {
 			atomic.AddUint64(&clientProtocolFailureSeq, 1)
+			if hsTracker.recordFailure() {
+				log.Printf("[客户端] 通道 %d (IP:%s) %s", chID, ipLabel, clientAuthFailureHint(hsTracker.consecutive))
+			}
 			_ = sess.Close()
 			if p.endpointPool != nil && targetIP != "" {
 				p.endpointPool.RecordResult(targetIP, false, 0)
@@ -225,6 +262,7 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 			}
 			continue
 		}
+		hsTracker.recordSuccess()
 		atomic.AddUint64(&clientProtocolOKSeq, 1)
 		log.Printf("[客户端] 通道 %d (IP:%s) v3 协议协商成功: transport=%s version=3 caps=0x%x cipher=%s", chID, ipLabel, sess.Type(), caps, v3CipherName(cipher))
 
