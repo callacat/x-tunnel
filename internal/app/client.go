@@ -106,6 +106,7 @@ type ECHPool struct {
 	selector          *transport.TransportSelector
 	endpointPool      *transport.EndpointPool
 	coverTraffic      bool
+	wg                sync.WaitGroup
 
 	// Snapshot of process-global client config, captured at construction so
 	// reconnect goroutines never read package-level variables that another
@@ -168,7 +169,26 @@ func (p *ECHPool) Start(ctx context.Context) {
 				ip = p.targetIPs[idx]
 			}
 		}
-		go p.dialAndServe(ctx, i, ip)
+		p.wg.Add(1)
+		go func(idx int, targetIP string) {
+			defer p.wg.Done()
+			p.dialAndServe(ctx, idx, targetIP)
+		}(i, ip)
+	}
+}
+
+// WaitDone blocks until all dial goroutines have returned or ctx expires.
+// Engine shutdown uses it to guarantee that no goroutine of a torn-down
+// Engine outlives it into the next Engine (which re-applies process globals).
+func (p *ECHPool) WaitDone(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
 	}
 }
 

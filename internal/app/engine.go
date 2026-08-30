@@ -44,6 +44,7 @@ type Engine struct {
 
 	listeners []*runtimeListener
 	control   *controlServer
+	echPool   *ECHPool
 	logs      *LogRing
 	logUndo   func()
 	fatalErr  error
@@ -116,6 +117,12 @@ func (e *Engine) abortStart(ctx context.Context) {
 
 	if cancel != nil {
 		cancel()
+	}
+	e.mu.Lock()
+	pool := e.echPool
+	e.mu.Unlock()
+	if pool != nil {
+		pool.WaitDone(ctx)
 	}
 	for _, listener := range listeners {
 		_ = listener.Close()
@@ -220,6 +227,9 @@ func (e *Engine) startRuntime() error {
 	log.Printf("[客户端] 客户端ID: %s", clientID)
 
 	echPool = NewECHPool(e.config.values.ForwardAddr, e.config.values.ConnectionNum, startup.TargetIPs, clientID)
+	e.mu.Lock()
+	e.echPool = echPool
+	e.mu.Unlock()
 	echPool.Start(e.ctx)
 
 	for _, listenerRule := range startup.Listeners {
@@ -331,6 +341,12 @@ func (e *Engine) Close(ctx context.Context) error {
 
 	if cancel != nil {
 		cancel()
+	}
+	e.mu.Lock()
+	pool := e.echPool
+	e.mu.Unlock()
+	if pool != nil {
+		pool.WaitDone(ctx)
 	}
 	for _, listener := range listeners {
 		_ = listener.Close()
