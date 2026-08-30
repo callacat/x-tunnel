@@ -22,9 +22,15 @@ var ErrUnsupported = errors.ErrUnsupported
 const defaultRekeyInterval uint64 = 1 << 32
 
 const (
+	// maxV3RecordPayload is the maximum AEAD plaintext envelope per record:
+	// 2-byte plaintext length + plaintext + padding.
 	maxV3RecordPayload     = 1400
 	coalesceFlushThreshold = 1024
 	v3RecordHeaderSize     = 12
+	// v3PlainLenSize is the size of the encrypted in-envelope plaintext length field.
+	v3PlainLenSize = 2
+	// maxV3RecordPlaintext is the maximum application plaintext per record.
+	maxV3RecordPlaintext = maxV3RecordPayload - v3PlainLenSize
 )
 
 const (
@@ -180,8 +186,8 @@ func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
 	if plainLen == 0 {
 		return nil
 	}
-	if plainLen > maxV3RecordPayload {
-		return fmt.Errorf("plaintext length %d exceeds maximum record payload %d", plainLen, maxV3RecordPayload)
+	if plainLen > maxV3RecordPlaintext {
+		return fmt.Errorf("plaintext length %d exceeds maximum record plaintext %d", plainLen, maxV3RecordPlaintext)
 	}
 
 	if s.writeCounter == math.MaxUint64 {
@@ -210,10 +216,11 @@ func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
 
 	padLen := 0
 	if s.PadRecords {
-		padLen = sampleRecordPadLen(maxV3RecordPayload - plainLen)
+		padLen = sampleRecordPadLen(maxV3RecordPayload - v3PlainLenSize - plainLen)
 	}
 
-	payloadLen := plainLen + padLen
+	// AEAD plaintext envelope: plain_len (2B BE) | plaintext | padding.
+	payloadLen := v3PlainLenSize + plainLen + padLen
 	cipherLen := payloadLen + 16
 	totalLen := v3RecordHeaderSize + cipherLen
 
@@ -223,28 +230,31 @@ func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
 		s.writeBuf = s.writeBuf[:totalLen]
 	}
 
-	// 12-byte header: counter (8B BE) | plain_len (2B BE) | pad_len (2B BE)
+	// 12-byte header: counter (8B BE) | payload_len (2B BE) | reserved (2B, zero).
+	// The true plaintext length lives inside the AEAD-encrypted envelope so
+	// padding cannot be adjusted away by an observer of the header.
 	binary.BigEndian.PutUint64(s.writeBuf[0:8], counter)
-	binary.BigEndian.PutUint16(s.writeBuf[8:10], uint16(plainLen))
-	binary.BigEndian.PutUint16(s.writeBuf[10:12], uint16(padLen))
+	binary.BigEndian.PutUint16(s.writeBuf[8:10], uint16(payloadLen))
+	binary.BigEndian.PutUint16(s.writeBuf[10:12], 0)
 
 	var nonce [12]byte
 	copy(nonce[0:4], s.writeNoncePrefix)
 	binary.BigEndian.PutUint64(nonce[4:12], counter)
 
-	var ad [8]byte
-	binary.BigEndian.PutUint64(ad[0:8], counter)
+	// The whole header is authenticated as additional data.
+	ad := s.writeBuf[0:v3RecordHeaderSize]
 
-	copy(s.writePayloadBuf[:plainLen], plain)
+	binary.BigEndian.PutUint16(s.writePayloadBuf[0:2], uint16(plainLen))
+	copy(s.writePayloadBuf[v3PlainLenSize:], plain)
 	if padLen > 0 {
-		if _, err := rand.Read(s.writePayloadBuf[plainLen:payloadLen]); err != nil {
-			for i := plainLen; i < payloadLen; i++ {
+		if _, err := rand.Read(s.writePayloadBuf[v3PlainLenSize+plainLen : payloadLen]); err != nil {
+			for i := v3PlainLenSize + plainLen; i < payloadLen; i++ {
 				s.writePayloadBuf[i] = 0
 			}
 		}
 	}
 
-	sealed := s.writeAEAD.Seal(s.writeBuf[v3RecordHeaderSize:v3RecordHeaderSize], nonce[:], s.writePayloadBuf[:payloadLen], ad[:])
+	sealed := s.writeAEAD.Seal(s.writeBuf[v3RecordHeaderSize:v3RecordHeaderSize], nonce[:], s.writePayloadBuf[:payloadLen], ad)
 	recordBytes := s.writeBuf[:v3RecordHeaderSize+len(sealed)]
 
 	_, err := s.inner.Write(recordBytes)
@@ -254,8 +264,8 @@ func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
 func (s *V3CipherStream) flushCoalesceBufLocked() error {
 	for len(s.coalesceBuf) > 0 {
 		chunkSize := len(s.coalesceBuf)
-		if chunkSize > maxV3RecordPayload {
-			chunkSize = maxV3RecordPayload
+		if chunkSize > maxV3RecordPlaintext {
+			chunkSize = maxV3RecordPlaintext
 		}
 		if err := s.writeRecordLocked(s.coalesceBuf[:chunkSize]); err != nil {
 			return err
@@ -299,8 +309,8 @@ func (s *V3CipherStream) Write(p []byte) (int, error) {
 		totalWritten := 0
 		for len(p) > 0 {
 			chunkSize := len(p)
-			if chunkSize > maxV3RecordPayload {
-				chunkSize = maxV3RecordPayload
+			if chunkSize > maxV3RecordPlaintext {
+				chunkSize = maxV3RecordPlaintext
 			}
 			chunk := p[:chunkSize]
 			if err := s.writeRecordLocked(chunk); err != nil {
@@ -318,8 +328,8 @@ func (s *V3CipherStream) Write(p []byte) (int, error) {
 
 	for len(s.coalesceBuf) >= coalesceFlushThreshold {
 		chunkSize := len(s.coalesceBuf)
-		if chunkSize > maxV3RecordPayload {
-			chunkSize = maxV3RecordPayload
+		if chunkSize > maxV3RecordPlaintext {
+			chunkSize = maxV3RecordPlaintext
 		}
 		if err := s.writeRecordLocked(s.coalesceBuf[:chunkSize]); err != nil {
 			return 0, err
@@ -358,26 +368,22 @@ func (s *V3CipherStream) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
+	// 12-byte header: counter (8B BE) | payload_len (2B BE) | reserved (2B).
 	var head [v3RecordHeaderSize]byte
 	if _, err := io.ReadFull(s.inner, head[:]); err != nil {
 		return 0, err
 	}
 	counter := binary.BigEndian.Uint64(head[0:8])
-	plainLen := int(binary.BigEndian.Uint16(head[8:10]))
-	padLen := int(binary.BigEndian.Uint16(head[10:12]))
+	payloadLen := int(binary.BigEndian.Uint16(head[8:10]))
 
 	if counter < 1 {
 		return 0, fmt.Errorf("invalid record counter: %d", counter)
 	}
-	if plainLen < 1 {
-		return 0, fmt.Errorf("invalid record plaintext length: %d", plainLen)
+	if payloadLen < v3PlainLenSize+1 {
+		return 0, fmt.Errorf("invalid record payload length: %d", payloadLen)
 	}
-	if padLen < 0 || plainLen+padLen > maxV3RecordPayload {
-		return 0, fmt.Errorf("invalid record payload length: plain=%d pad=%d", plainLen, padLen)
-	}
-
-	if !s.readWindow.checkAndAdd(counter) {
-		return 0, fmt.Errorf("record counter rejected (replay or out of window): %d", counter)
+	if payloadLen > maxV3RecordPayload {
+		return 0, fmt.Errorf("record payload length %d exceeds maximum %d", payloadLen, maxV3RecordPayload)
 	}
 
 	interval := s.RekeyInterval
@@ -398,7 +404,6 @@ func (s *V3CipherStream) Read(p []byte) (int, error) {
 		s.readGen = gen
 	}
 
-	payloadLen := plainLen + padLen
 	cipherLen := payloadLen + 16
 	if cap(s.readCipherBuf) < cipherLen {
 		s.readCipherBuf = make([]byte, cipherLen)
@@ -413,22 +418,33 @@ func (s *V3CipherStream) Read(p []byte) (int, error) {
 	copy(nonce[0:4], s.readNoncePrefix)
 	binary.BigEndian.PutUint64(nonce[4:12], counter)
 
-	var ad [8]byte
-	binary.BigEndian.PutUint64(ad[0:8], counter)
+	// The whole header is authenticated as additional data.
+	ad := head[:]
 
 	if cap(s.readPlainAlloc) < payloadLen {
 		s.readPlainAlloc = make([]byte, 0, payloadLen)
 	}
-	decrypted, err := s.readAEAD.Open(s.readPlainAlloc[:0], nonce[:], s.readCipherBuf, ad[:])
+	decrypted, err := s.readAEAD.Open(s.readPlainAlloc[:0], nonce[:], s.readCipherBuf, ad)
 	if err != nil {
 		return 0, fmt.Errorf("record decryption failed: %w", err)
 	}
 	if len(decrypted) != payloadLen {
 		return 0, fmt.Errorf("decrypted length mismatch: got %d, want %d", len(decrypted), payloadLen)
 	}
-	s.readPlainAlloc = decrypted
 
-	plain := decrypted[:plainLen]
+	// Only advance the replay window after successful AEAD verification, so a
+	// forged header counter cannot poison the window and stall the connection.
+	if !s.readWindow.checkAndAdd(counter) {
+		return 0, fmt.Errorf("record counter rejected (replay or out of window): %d", counter)
+	}
+
+	plainLen := int(binary.BigEndian.Uint16(decrypted[0:2]))
+	if plainLen < 1 || v3PlainLenSize+plainLen > payloadLen {
+		return 0, fmt.Errorf("invalid inner plaintext length: %d (payload %d)", plainLen, payloadLen)
+	}
+
+	s.readPlainAlloc = decrypted
+	plain := decrypted[v3PlainLenSize : v3PlainLenSize+plainLen]
 	n := copy(p, plain)
 	s.readPlainBuf = plain[n:]
 	return n, nil
