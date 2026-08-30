@@ -35,6 +35,9 @@ type UDPAssociation struct {
 	channelID int
 	target    string
 	stream    *smux.Stream
+	// round41：UDP DIRECT 出口——GEO 分流判定 direct 的 UDP 目标（如国内
+	// DNS 223.5.5.5:53）经本机 socket 直发，不占隧道。nil = 走隧道（现状）。
+	directConn *net.UDPConn
 }
 
 func parseAuthAndAddr(full string) (string, string, string, error) {
@@ -426,6 +429,16 @@ func (a *UDPAssociation) loop() {
 }
 
 func (a *UDPAssociation) send(target string, data []byte) {
+	// round41：UDP 分流判定。GEO 引擎启用且目标判定 direct（国内 DNS/国内 UDP
+	// 服务）→ 本机 socket 直发（不占隧道）；其余/引擎未启用 → 走隧道（现状）。
+	// DNS 响应同样会在 direct 路径上被嗅探（写 IP→域名映射）。
+	host, _, _ := net.SplitHostPort(target)
+	routeHost, routeIP := routeRT.resolveHostForRoute(host)
+	if decideForTarget(routeHost, routeIP) == routeDirect {
+		a.sendDirect(target, data)
+		return
+	}
+
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -478,6 +491,108 @@ func (a *UDPAssociation) send(target string, data []byte) {
 	}
 }
 
+// sendDirect 是 UDP 的 DIRECT 出口（round41）：目标地址解析后用独立本机
+// UDP socket 直发，起一个 goroutine 读响应回写客户端（含 DNS 嗅探）。
+// socket 按目标懒创建；目标变更时重建（UDPAssociation 本身绑定单目标，
+// 上游 send 已挡不同 target，这里防御性处理）。
+func (a *UDPAssociation) sendDirect(target string, data []byte) {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return
+	}
+	conn := a.directConn
+	boundTo := a.target
+	needStart := conn == nil || (boundTo != "" && boundTo != target)
+	a.mu.Unlock()
+
+	if needStart {
+		raddr, err := net.ResolveUDPAddr("udp", target)
+		if err != nil {
+			log.Printf("[客户端] %s UDP-DIRECT 解析目标失败 %s: %v", clientSourceAddr(a.tcpConn), target, err)
+			return
+		}
+		// 绑定与客户端 listener 同一地址族（v4 目标绑 v4 通配，避免HappyEyeballs问题）。
+		laddr := &net.UDPAddr{Port: 0}
+		if raddr.IP.To4() == nil {
+			laddr.IP = net.IPv6unspecified
+		}
+		nc, err := net.ListenUDP("udp", laddr)
+		if err != nil {
+			log.Printf("[客户端] %s UDP-DIRECT 建立失败 %s: %v", clientSourceAddr(a.tcpConn), target, err)
+			return
+		}
+		a.mu.Lock()
+		if a.directConn != nil && a.directConn != nc {
+			_ = a.directConn.Close()
+		}
+		a.directConn = nc
+		a.mu.Unlock()
+		conn = nc
+		log.Printf("[客户端] udp_assoc=%d UDP-DIRECT 绑定目标 %s 本地 %s", a.id, target, nc.LocalAddr())
+		go a.directReadLoop(nc)
+	}
+	if conn == nil {
+		return
+	}
+	raddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return
+	}
+	if _, err := conn.WriteToUDP(data, raddr); err != nil {
+		log.Printf("[客户端] udp_assoc=%d UDP-DIRECT 写入失败 %s: %v", a.id, target, err)
+	}
+}
+
+// directReadLoop 读 DIRECT socket 的响应，组 SOCKS5 UDP 帧回写客户端；
+// DNS（端口 53）响应走嗅探写 IP→域名映射。
+func (a *UDPAssociation) directReadLoop(conn *net.UDPConn) {
+	buf := make([]byte, 65535)
+	for {
+		conn.SetReadDeadline(time.Now().Add(cfg.UDPReadTimeout))
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				// 空闲超时不关 socket（保持直发通道），继续等下一包。
+				continue
+			}
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		if from != nil && from.Port == 53 {
+			if qname, ips := sniffDNSAnswers(payload); qname != "" {
+				for _, ip := range ips {
+					rememberHostFromDNS(ip, qname)
+				}
+			}
+		}
+		host := ""
+		if from != nil {
+			host = from.IP.String()
+		}
+		port := 0
+		if from != nil {
+			port = from.Port
+		}
+		pkt, err := buildSOCKS5UDPPacket(host, port, payload)
+		if err != nil {
+			continue
+		}
+		a.mu.Lock()
+		client := a.clientUDPAddr
+		closed := a.closed
+		a.mu.Unlock()
+		if closed || client == nil {
+			return
+		}
+		_, _ = writeUDPDatagram(a.udpListener, pkt, client)
+	}
+}
+
 func (a *UDPAssociation) handleUDPResponse(addrStr string, data []byte) {
 	host, portStr, err := net.SplitHostPort(addrStr)
 	if err != nil {
@@ -517,8 +632,10 @@ func (a *UDPAssociation) Close() {
 	stream := a.stream
 	target := a.target
 	chID := a.channelID
+	directConn := a.directConn
 	a.closed = true
 	a.stream = nil
+	a.directConn = nil
 	active := a.active
 	a.active = false
 	a.mu.Unlock()
@@ -527,6 +644,9 @@ func (a *UDPAssociation) Close() {
 	}
 	if stream != nil {
 		_ = stream.Close()
+	}
+	if directConn != nil {
+		_ = directConn.Close() // 中断 directReadLoop
 	}
 	if chID > 0 && target != "" {
 		log.Printf("[客户端] udp_assoc=%d SOCKS5-UDP 关联关闭 target=%s 通道 %d", a.id, target, chID)

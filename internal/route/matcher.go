@@ -113,6 +113,12 @@ func (e *Engine) Match(host string, ip netip.Addr) (string, Rule, bool) {
 			if geoIP != nil && geoIP.Contains(r.Value, ip) {
 				return e.hit(r)
 			}
+			// round41：cn 降级兜底——GEO 库缺失（下载中/失败）时 geoip:cn 用内置
+			// 超聚合段判定，避免国内流量在库就绪前全部兜底走隧道（r40 真机实测
+			// 国内访问极慢的根因）。库已加载时只用真实库（精确覆盖）。
+			if geoIP == nil && strings.EqualFold(r.Value, "cn") && builtinCNContains(ip) {
+				return e.hit(r)
+			}
 		}
 	}
 
