@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +61,47 @@ func TestQuicEndToEndTCPForward(t *testing.T) {
 
 	resp := fetchHTTP(t, "http://"+tcpAddr+"/test")
 	assertBody(t, "quic tcp forward", resp, expectedBody)
+}
+
+func TestQuicClientChannelUpMetric(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	binPath := buildIntegrationBinary(t, ctx)
+	wssAddr := freeTCPAddr(t)
+	clientMetricsAddr := freeTCPAddr(t)
+
+	serverLog := t.TempDir() + "/server.log"
+	clientLog := t.TempDir() + "/client.log"
+
+	server := startXTunnel(t, ctx, binPath, serverLog,
+		"-l", "wss://"+wssAddr+"/tunnel",
+		"-token", "quic-metrics-token",
+		"-cidr", "127.0.0.1/32",
+		"-allow-target", "127.0.0.0/8",
+	)
+	defer stopProcess(server)
+	waitTCP(t, ctx, wssAddr, server)
+	waitLogContains(t, ctx, serverLog, "QUIC 启动", server)
+
+	client := startXTunnel(t, ctx, binPath, clientLog,
+		"-l", "socks5://"+freeTCPAddr(t),
+		"-f", "wss://"+wssAddr+"/tunnel",
+		"-token", "quic-metrics-token",
+		"-n", "1",
+		"-insecure",
+		"-transport", "quic",
+		"-metrics", clientMetricsAddr,
+	)
+	defer stopProcess(client)
+	waitTCP(t, ctx, clientMetricsAddr, client)
+	waitLogContains(t, ctx, clientLog, "就绪 (quic)", client)
+
+	assertMetricValue(t, fetchHTTP(t, "http://"+clientMetricsAddr+"/metrics"), `x_tunnel_client_channel_up{channel="1"}`, "1")
 }
 
 func TestDualStackAutoFallback(t *testing.T) {
@@ -225,5 +268,87 @@ func TestQuicDatagramRelayDirect(t *testing.T) {
 	}
 	if string(respFrame.Payload) != string(testMsg) {
 		t.Fatalf("payload = %s, want %s", string(respFrame.Payload), string(testMsg))
+	}
+}
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("find free udp port: %v", err)
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+// TestQuicSeparatePortEndToEnd 验证服务端 -quic-port 分端口部署时，
+// 客户端通过同名参数将 QUIC 拨号指向独立端口（auto 直接 QUIC 就绪，quic-only 亦可连通）。
+func TestQuicSeparatePortEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const expectedBody = "quic-separate-port-e2e\n"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(expectedBody))
+	}))
+	defer origin.Close()
+	targetAddr := strings.TrimPrefix(origin.URL, "http://")
+
+	binPath := buildIntegrationBinary(t, ctx)
+	wssAddr := freeTCPAddr(t)
+	quicPort := freeUDPPort(t)
+	_, wssPort, err := net.SplitHostPort(wssAddr)
+	if err != nil {
+		t.Fatalf("split wss addr: %v", err)
+	}
+	quicListenAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(quicPort))
+	if strconv.Itoa(quicPort) == wssPort {
+		t.Fatalf("quic port conflicts with wss port %s", wssPort)
+	}
+
+	serverLog := t.TempDir() + "/server-sep.log"
+	server := startXTunnel(t, ctx, binPath, serverLog,
+		"-l", "wss://"+wssAddr+"/tunnel",
+		"-quic-port", strconv.Itoa(quicPort),
+		"-token", "sep-port-token",
+		"-cidr", "127.0.0.1/32",
+		"-allow-target", "127.0.0.0/8",
+	)
+	defer stopProcess(server)
+	waitTCP(t, ctx, wssAddr, server)
+	waitLogContains(t, ctx, serverLog, "QUIC 启动 "+quicListenAddr, server)
+
+	for _, mode := range []string{"auto", "quic"} {
+		t.Run(mode, func(t *testing.T) {
+			tcpAddr := freeTCPAddr(t)
+			clientLog := t.TempDir() + "/client-sep-" + mode + ".log"
+			client := startXTunnel(t, ctx, binPath, clientLog,
+				"-l", "tcp://"+tcpAddr+"/"+targetAddr,
+				"-f", "wss://"+wssAddr+"/tunnel",
+				"-quic-port", strconv.Itoa(quicPort),
+				"-token", "sep-port-token",
+				"-n", "1",
+				"-insecure",
+				"-transport", mode,
+			)
+			defer stopProcess(client)
+			waitTCP(t, ctx, tcpAddr, client)
+			waitLogContains(t, ctx, clientLog, "transport=quic", client)
+			waitLogContains(t, ctx, clientLog, "就绪 (quic)", client)
+
+			resp := fetchHTTP(t, "http://"+tcpAddr+"/test")
+			assertBody(t, "quic separate port forward", resp, expectedBody)
+
+			raw, err := os.ReadFile(clientLog)
+			if err != nil {
+				t.Fatalf("read client log: %v", err)
+			}
+			if strings.Contains(string(raw), "回退至 TCP") {
+				t.Fatalf("client fell back to TCP/WSS despite working QUIC port:\n%s", raw)
+			}
+		})
 	}
 }

@@ -153,6 +153,7 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 				TLSConfig:         tlsConf,
 				TargetIP:          targetIP,
 				ServerName:        serverName,
+				QUICPort:          quicPort,
 				Timeout:           cfg.WSHandshakeTimeout,
 				KeepAliveInterval: 10 * time.Second,
 				MaxIdleTimeout:    30 * time.Second,

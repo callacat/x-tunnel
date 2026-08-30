@@ -260,7 +260,7 @@ func init() {
 	flag.Float64Var(&pacingRateMbps, "pacing-rate-mbps", 0, "客户端发送端 pacing 速率 (Mbps，0 表示禁用)")
 	flag.IntVar(&shapingCoalesceMs, "shaping-coalesce-ms", 0, "客户端小包合并延迟上限 (毫秒，0 表示禁用合并)")
 	flag.StringVar(&transportMode, "transport", "auto", "传输层模式 (auto: 优先 QUIC 自动回退 TCP/WSS | quic: 仅 QUIC | tcp: 仅 TCP/WSS)")
-	flag.IntVar(&quicPort, "quic-port", 0, "服务端 QUIC 独立监听端口 (0 表示复用主监听端口的 UDP)")
+	flag.IntVar(&quicPort, "quic-port", 0, "服务端 QUIC 独立监听端口；客户端拨号 QUIC 时也使用该端口 (0 表示复用主端口的 UDP)")
 	flag.BoolVar(&enableDatagram, "enable-datagram", true, "是否启用 RFC 9221 QUIC Datagram 进行原生 UDP 代理")
 	flag.BoolVar(&coverTraffic, "cover-traffic", false, "是否启用连接空闲时的 cover traffic 拟形混淆")
 	flag.IntVar(&connectionNum, "n", 3, "每个IP建立的WebSocket连接数量")

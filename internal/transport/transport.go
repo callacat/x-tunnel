@@ -33,6 +33,7 @@ type DialOptions struct {
 	Path              string
 	Header            http.Header
 	TargetIP          string
+	QUICPort          int
 	Timeout           time.Duration
 	KeepAliveInterval time.Duration
 	MaxIdleTimeout    time.Duration

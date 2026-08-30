@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -152,6 +153,12 @@ func (t *QuicTransport) DialSession(ctx context.Context, rawAddr string, opts Di
 	if err != nil {
 		host = targetAddr
 		port = "443"
+		targetAddr = net.JoinHostPort(host, port)
+	}
+
+	// QUIC 独立监听端口：服务端分端口部署时客户端拨号端口与主端口不同
+	if opts.QUICPort > 0 {
+		port = strconv.Itoa(opts.QUICPort)
 		targetAddr = net.JoinHostPort(host, port)
 	}
 
