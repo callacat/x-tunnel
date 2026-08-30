@@ -335,20 +335,20 @@ func TestV3GoldenVectors(t *testing.T) {
 		var nonceArr [12]byte
 		copy(nonceArr[0:4], keys.C2SNoncePrefix)
 		binary.BigEndian.PutUint64(nonceArr[4:12], counter)
-		var ad [8]byte
-		binary.BigEndian.PutUint64(ad[0:8], counter)
-
 		aead, err := chacha20poly1305.New(c2sChaChaKey)
 		if err != nil {
 			t.Fatalf("chacha20poly1305.New error: %v", err)
 		}
 		rec := make([]byte, 12)
+		env := make([]byte, 0, 2+len(plain))
+		env = binary.BigEndian.AppendUint16(env, uint16(len(plain)))
+		env = append(env, plain...)
 		binary.BigEndian.PutUint64(rec[0:8], counter)
-		binary.BigEndian.PutUint16(rec[8:10], uint16(len(plain)))
-		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
-		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
+		binary.BigEndian.PutUint16(rec[8:10], uint16(len(env)))
+		binary.BigEndian.PutUint16(rec[10:12], 0) // reserved
+		rec = aead.Seal(rec, nonceArr[:], env, rec[:12])
 
-		const wantChaChaRecordHex = "000000000000000100160000cbca217468d25c24a38079925f0e5b16731e359e8d8c55f7e08579b65d0e3f4c3425120036a4"
+		const wantChaChaRecordHex = "000000000000000100180000a3b9257d6b9e4b70ae9a62995d4b4105254b679992883455adcce49c4254a0e430b1bdfaae2d4fbe"
 		if hex.EncodeToString(rec) != wantChaChaRecordHex {
 			t.Fatalf("ChaCha record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantChaChaRecordHex)
 		}
@@ -360,9 +360,6 @@ func TestV3GoldenVectors(t *testing.T) {
 		var nonceArr [12]byte
 		copy(nonceArr[0:4], keys.S2CNoncePrefix)
 		binary.BigEndian.PutUint64(nonceArr[4:12], counter)
-		var ad [8]byte
-		binary.BigEndian.PutUint64(ad[0:8], counter)
-
 		block, err := aes.NewCipher(s2cAES256Key)
 		if err != nil {
 			t.Fatalf("aes.NewCipher error: %v", err)
@@ -372,12 +369,15 @@ func TestV3GoldenVectors(t *testing.T) {
 			t.Fatalf("cipher.NewGCM error: %v", err)
 		}
 		rec := make([]byte, 12)
+		env := make([]byte, 0, 2+len(plain))
+		env = binary.BigEndian.AppendUint16(env, uint16(len(plain)))
+		env = append(env, plain...)
 		binary.BigEndian.PutUint64(rec[0:8], counter)
-		binary.BigEndian.PutUint16(rec[8:10], uint16(len(plain)))
-		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
-		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
+		binary.BigEndian.PutUint16(rec[8:10], uint16(len(env)))
+		binary.BigEndian.PutUint16(rec[10:12], 0) // reserved
+		rec = aead.Seal(rec, nonceArr[:], env, rec[:12])
 
-		const wantAES256RecordHex = "000000000000000100160000b0d764d22b5727d7e731a6342b22ac086fedf471e830b2d44508d960398b5a8fa2bc245cfd94"
+		const wantAES256RecordHex = "000000000000000100180000d8a460db281b3083ea2bbd3f2967b61b39b8a676f7344d311d49f0460a110e3bc3733e183f87a293"
 		if hex.EncodeToString(rec) != wantAES256RecordHex {
 			t.Fatalf("AES256 record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantAES256RecordHex)
 		}
@@ -389,9 +389,6 @@ func TestV3GoldenVectors(t *testing.T) {
 		var nonceArr [12]byte
 		copy(nonceArr[0:4], keys.C2SNoncePrefix)
 		binary.BigEndian.PutUint64(nonceArr[4:12], counter)
-		var ad [8]byte
-		binary.BigEndian.PutUint64(ad[0:8], counter)
-
 		block, err := aes.NewCipher(c2sAES128Key)
 		if err != nil {
 			t.Fatalf("aes.NewCipher error: %v", err)
@@ -401,12 +398,15 @@ func TestV3GoldenVectors(t *testing.T) {
 			t.Fatalf("cipher.NewGCM error: %v", err)
 		}
 		rec := make([]byte, 12)
+		env := make([]byte, 0, 2+len(plain))
+		env = binary.BigEndian.AppendUint16(env, uint16(len(plain)))
+		env = append(env, plain...)
 		binary.BigEndian.PutUint64(rec[0:8], counter)
-		binary.BigEndian.PutUint16(rec[8:10], uint16(len(plain)))
-		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
-		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
+		binary.BigEndian.PutUint16(rec[8:10], uint16(len(env)))
+		binary.BigEndian.PutUint16(rec[10:12], 0) // reserved
+		rec = aead.Seal(rec, nonceArr[:], env, rec[:12])
 
-		const wantAES128RecordHex = "0000000000000001001600006fb0ab7cbde3278e6604798aff5f344d2f025871acee779650d7fc48e4e535b29c4fab377636"
+		const wantAES128RecordHex = "00000000000000010018000007c3af75beaf30da6b1e6281fd1a2e5e79570a76b3ea2223139bc7633e3d4cc3d50f9c95603467c5"
 		if hex.EncodeToString(rec) != wantAES128RecordHex {
 			t.Fatalf("AES128 record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantAES128RecordHex)
 		}
@@ -418,11 +418,12 @@ func TestV3GoldenVectors(t *testing.T) {
 		var nonceArr [12]byte
 		copy(nonceArr[0:4], keys.C2SNoncePrefix)
 		binary.BigEndian.PutUint64(nonceArr[4:12], counter)
-		var ad [8]byte
-		binary.BigEndian.PutUint64(ad[0:8], counter)
-
 		pad := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
-		payload := append(append([]byte(nil), plain...), pad...)
+		// Envelope: plain_len (2B BE) | plain | pad.
+		payload := make([]byte, 0, 2+len(plain)+len(pad))
+		payload = binary.BigEndian.AppendUint16(payload, uint16(len(plain)))
+		payload = append(payload, plain...)
+		payload = append(payload, pad...)
 
 		aead, err := chacha20poly1305.New(c2sChaChaKey)
 		if err != nil {
@@ -430,11 +431,11 @@ func TestV3GoldenVectors(t *testing.T) {
 		}
 		rec := make([]byte, 12)
 		binary.BigEndian.PutUint64(rec[0:8], counter)
-		binary.BigEndian.PutUint16(rec[8:10], uint16(len(plain)))
-		binary.BigEndian.PutUint16(rec[10:12], uint16(len(pad))) // pad_len = 5
-		rec = aead.Seal(rec, nonceArr[:], payload, ad[:])
+		binary.BigEndian.PutUint16(rec[8:10], uint16(len(payload)))
+		binary.BigEndian.PutUint16(rec[10:12], 0) // reserved
+		rec = aead.Seal(rec, nonceArr[:], payload, rec[:12])
 
-		const wantChaChaPaddedRecordHex = "000000000000000100160005cbca217468d25c24a38079925f0e5b16731e359e8d8c5832acb196a3211e8d665d3b61407978d6d599914c"
+		const wantChaChaPaddedRecordHex = "0000000000000001001d0000a3b9257d6b9e4b70ae9a62995d4b4105254b679992883455aeb790a5f8f62ee115df09a5ae5a4e622e9398efe3"
 		if hex.EncodeToString(rec) != wantChaChaPaddedRecordHex {
 			t.Fatalf("ChaCha padded record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantChaChaPaddedRecordHex)
 		}
@@ -783,8 +784,9 @@ func TestV3CipherStreamBitFlipAndIntegrity(t *testing.T) {
 				}
 
 				rawRecord := append([]byte(nil), pipeBuf.Bytes()...)
-				if len(rawRecord) != 12+len(payload)+16 {
-					t.Fatalf("raw record len = %d, want %d", len(rawRecord), 12+len(payload)+16)
+				// envelope = plain_len(2) + plain; no pad
+				if len(rawRecord) != 12+2+len(payload)+16 {
+					t.Fatalf("raw record len = %d, want %d", len(rawRecord), 12+2+len(payload)+16)
 				}
 
 				// Verify normal read works
@@ -803,20 +805,20 @@ func TestV3CipherStreamBitFlipAndIntegrity(t *testing.T) {
 					}
 				}
 
-				// Bit flip tests at counter, plain_len, pad_len, ciphertext, and tag
+				// Bit flip tests at counter, header fields (authenticated as AD), ciphertext, and tag
 				testPositions := []struct {
 					name string
 					idx  int
 				}{
 					{"counter byte 0", 0},
 					{"counter byte 7", 7},
-					{"plain_len byte 8", 8},
-					{"plain_len byte 9", 9},
-					{"pad_len byte 10", 10},
-					{"pad_len byte 11", 11},
+					{"payload_len byte 8", 8},
+					{"payload_len byte 9", 9},
+					{"reserved byte 10", 10},
+					{"reserved byte 11", 11},
 					{"ciphertext byte 12", 12},
 					{"ciphertext byte 20", 20},
-					{"tag byte first", 12 + len(payload)},
+					{"tag byte first", 12 + 2 + len(payload)},
 					{"tag byte last", len(rawRecord) - 1},
 				}
 
@@ -848,14 +850,16 @@ func TestV3CipherStreamBitFlipAndIntegrity(t *testing.T) {
 				counter := uint64(1)
 				plain := []byte("confidential-payload-data-to-protect")
 				pad := bytes.Repeat([]byte{0xaa}, 50)
-				payload := append(append([]byte(nil), plain...), pad...)
+				// Envelope: plain_len(2B BE) | plain | pad.
+				payload := make([]byte, 0, 2+len(plain)+len(pad))
+				payload = binary.BigEndian.AppendUint16(payload, uint16(len(plain)))
+				payload = append(payload, plain...)
+				payload = append(payload, pad...)
 
 				key, _ := keys.StreamKey(cipherID, true, 1, 0)
 				var nonceArr [12]byte
 				copy(nonceArr[0:4], keys.C2SNoncePrefix)
 				binary.BigEndian.PutUint64(nonceArr[4:12], counter)
-				var ad [8]byte
-				binary.BigEndian.PutUint64(ad[0:8], counter)
 
 				aead, err := newAEAD(cipherID, key)
 				if err != nil {
@@ -864,9 +868,9 @@ func TestV3CipherStreamBitFlipAndIntegrity(t *testing.T) {
 
 				rec := make([]byte, 12)
 				binary.BigEndian.PutUint64(rec[0:8], counter)
-				binary.BigEndian.PutUint16(rec[8:10], uint16(len(plain)))
-				binary.BigEndian.PutUint16(rec[10:12], uint16(len(pad)))
-				rec = aead.Seal(rec, nonceArr[:], payload, ad[:])
+				binary.BigEndian.PutUint16(rec[8:10], uint16(len(payload)))
+				binary.BigEndian.PutUint16(rec[10:12], 0) // reserved
+				rec = aead.Seal(rec, nonceArr[:], payload, rec[:12])
 
 				// Normal read must succeed and discard pad
 				{
@@ -884,15 +888,15 @@ func TestV3CipherStreamBitFlipAndIntegrity(t *testing.T) {
 					}
 				}
 
-				// Bit flip tests covering pad_len, plain area, pad area, and tag
+				// Bit flip tests covering header, plain area, pad area, and tag
 				paddedPositions := []struct {
 					name string
 					idx  int
 				}{
-					{"pad_len byte 10", 10},
-					{"pad_len byte 11", 11},
-					{"ciphertext plain byte", 12 + 5},
-					{"ciphertext pad byte", 12 + len(plain) + 10},
+					{"payload_len byte 9", 9},
+					{"reserved byte 10", 10},
+					{"ciphertext plain byte", 12 + 2 + 5},
+					{"ciphertext pad byte", 12 + 2 + len(plain) + 10},
 					{"tag byte", 12 + len(payload) + 5},
 				}
 
@@ -1147,12 +1151,11 @@ func TestV3CipherStreamPayloadLimit(t *testing.T) {
 	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
 	keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
-	// Case 1: plain_len + pad_len > 1400 -> Read rejects
+	// Case 1: payload_len > 1400 -> Read rejects
 	{
 		var raw [12 + 1401 + 16]byte
 		binary.BigEndian.PutUint64(raw[0:8], 1)
-		binary.BigEndian.PutUint16(raw[8:10], 1000)
-		binary.BigEndian.PutUint16(raw[10:12], 401) // 1000 + 401 = 1401 > 1400
+		binary.BigEndian.PutUint16(raw[8:10], 1401) // payload_len = 1401 > 1400
 
 		serverStream, err := NewV3CipherStream(&nopCloser{Buffer: bytes.NewBuffer(raw[:])}, keys, ProtocolCipherChaCha20Poly1305, 1, false)
 		if err != nil {
@@ -1160,16 +1163,15 @@ func TestV3CipherStreamPayloadLimit(t *testing.T) {
 		}
 		buf := make([]byte, 1000)
 		if _, err := serverStream.Read(buf); err == nil {
-			t.Fatal("expected Read error for plain_len+pad_len > 1400, got nil")
+			t.Fatal("expected Read error for payload_len > 1400, got nil")
 		}
 	}
 
-	// Case 2: plain_len == 0 -> Read rejects
+	// Case 2: payload_len too small for inner length field + 1B plaintext -> Read rejects
 	{
-		var raw [12 + 100]byte
+		var raw [12 + 2 + 16]byte
 		binary.BigEndian.PutUint64(raw[0:8], 1)
-		binary.BigEndian.PutUint16(raw[8:10], 0) // plain_len = 0
-		binary.BigEndian.PutUint16(raw[10:12], 10)
+		binary.BigEndian.PutUint16(raw[8:10], 2) // room for length field only
 
 		serverStream, err := NewV3CipherStream(&nopCloser{Buffer: bytes.NewBuffer(raw[:])}, keys, ProtocolCipherChaCha20Poly1305, 1, false)
 		if err != nil {
@@ -1177,7 +1179,7 @@ func TestV3CipherStreamPayloadLimit(t *testing.T) {
 		}
 		buf := make([]byte, 100)
 		if _, err := serverStream.Read(buf); err == nil {
-			t.Fatal("expected Read error for plain_len == 0, got nil")
+			t.Fatal("expected Read error for undersized payload_len, got nil")
 		}
 	}
 
@@ -1186,7 +1188,7 @@ func TestV3CipherStreamPayloadLimit(t *testing.T) {
 		var raw [12 + 100]byte
 		binary.BigEndian.PutUint64(raw[0:8], 0) // counter = 0
 		binary.BigEndian.PutUint16(raw[8:10], 10)
-		binary.BigEndian.PutUint16(raw[10:12], 0)
+		binary.BigEndian.PutUint16(raw[10:12], 0) // reserved
 
 		serverStream, err := NewV3CipherStream(&nopCloser{Buffer: bytes.NewBuffer(raw[:])}, keys, ProtocolCipherChaCha20Poly1305, 1, false)
 		if err != nil {
@@ -1230,15 +1232,10 @@ func TestV3CipherStreamPaddingSamplingStats(t *testing.T) {
 		if len(raw) < 12+len(payload)+16 {
 			t.Fatalf("record %d too short: %d", i, len(raw))
 		}
-		plainLen := int(binary.BigEndian.Uint16(raw[8:10]))
-		padLen := int(binary.BigEndian.Uint16(raw[10:12]))
-
-		if plainLen != 10 {
-			t.Fatalf("record %d plainLen = %d, want 10", i, plainLen)
-		}
-		totalPayload := plainLen + padLen
-		if totalPayload < 10 || totalPayload > maxV3RecordPayload {
-			t.Fatalf("record %d total payload %d out of bounds [10, 1400]", i, totalPayload)
+		payloadLen := int(binary.BigEndian.Uint16(raw[8:10]))
+		padLen := payloadLen - v3PlainLenSize - len(payload)
+		if padLen < 0 || payloadLen > maxV3RecordPayload {
+			t.Fatalf("record %d payload_len %d out of bounds for 10-byte plaintext", i, payloadLen)
 		}
 		uniquePadLens[padLen] = true
 
