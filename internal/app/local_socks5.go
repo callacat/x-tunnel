@@ -439,26 +439,26 @@ func (a *UDPAssociation) loop() {
 }
 
 func (a *UDPAssociation) send(target string, data []byte) {
-	// round43：DNS 源分流（根治 DNS 污染，对齐 warp-go 阶段12）。目标 :53 的
-	// DNS 查询先解出 QNAME，按域名规则判定解析源：
-	//   - 国内域名（route→direct）→ 223.5.5.5 直连解析（国内 CDN 视角，快）
-	//   - 其余/境外域名 → **改写目标为 1.1.1.1:53 走隧道**（境外解析视角，
-	//     无污染）——r42 实锤：全部用国内 DNS 时境外域名拿到污染 IP，
-	//     geoip:cn 误判直连 → GFW 假证书（「部分外网提示不安全」根因）
-	//   - 非端口 53 的 UDP → 按 IP 分流判定（round41 语义）
+	// round45：DNS 源分流（r43 语义反转修正，r44 真机实锤全断根因）。
+	// 目标 :53 的 DNS 查询先解出 QNAME，按域名规则判定解析源：
+	//   - 明确命中 proxy 规则的域名（geosite:google / geolocation-!cn 等）→
+	//     改写目标 1.1.1.1:53 走隧道解析（境外视角，防污染）
+	//   - **其余全部（direct 命中 / 规则未命中 / GEO 库未就绪）→ 国内直连解析
+	//     223.5.5.5**——保底可达。r43 把「未命中」也推到隧道 DNS，GEO 库缺失时
+	//     国内域名全被改写走隧道；隧道 UDP DNS 一旦不稳（r44 实锤：assoc 开着
+	//     5.9s 无回包）= 所有域名解析失败 = 完全断网。
+	//   - 引擎未启用（GEO off）→ 保持客户端原目标不动（现状零回归）。
 	host, portStr, _ := net.SplitHostPort(target)
 	if portStr == "53" && routeRT.engineSnapshot() != nil {
 		if qname, ok := sniffDNSQuery(data); ok {
-			if decideForTarget(qname, netip.Addr{}) != routeDirect {
-				// 境外域名：改写 DNS 目标走隧道（保留客户端原目标的响应语义
-				// 由 DNS 报文自身保证——问什么答什么，目标 IP 只是承载）。
-				rewritten := net.JoinHostPort(tunnelDNSHost, "53")
-				if rewritten != target {
+			if decideForTarget(qname, netip.Addr{}) == routeProxy {
+				// 明确 proxy 的境外域名：走隧道解析（无污染视角）。
+				if rewritten := net.JoinHostPort(tunnelDNSHost, "53"); rewritten != target {
 					target = rewritten
 					host = tunnelDNSHost
 				}
 			} else if host != directDNSHost {
-				// 国内域名但上游没指国内 DNS（如全局模式 1.1.1.1）：改直连解析。
+				// direct 命中 / 未命中 / 库未就绪：国内直连解析（保底可达）。
 				target = net.JoinHostPort(directDNSHost, "53")
 				host = directDNSHost
 			}
