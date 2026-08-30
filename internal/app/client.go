@@ -106,6 +106,15 @@ type ECHPool struct {
 	selector          *transport.TransportSelector
 	endpointPool      *transport.EndpointPool
 	coverTraffic      bool
+
+	// Snapshot of process-global client config, captured at construction so
+	// reconnect goroutines never read package-level variables that another
+	// Engine instance may overwrite (data race under parallel tests).
+	tlsInsecure    bool
+	clientCertFile string
+	clientKeyFile  string
+	quicPort       int
+	enableDatagram bool
 }
 
 func (p *ECHPool) channelV3Security(idx int) (V3SessionKeys, byte, bool) {
@@ -134,6 +143,11 @@ func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 		channelKeys:       make([]V3SessionKeys, total),
 		channelCiphers:    make([]byte, total),
 		coverTraffic:      coverTraffic,
+		tlsInsecure:       insecure,
+		clientCertFile:    clientCertFile,
+		clientKeyFile:     clientKeyFile,
+		quicPort:          quicPort,
+		enableDatagram:    enableDatagram,
 	}
 	mode := transport.TransportType(strings.ToLower(strings.TrimSpace(transportMode)))
 	if mode == "" {
@@ -190,10 +204,10 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 		var err error
 
 		tlsConf := &tls.Config{
-			InsecureSkipVerify: insecure,
+			InsecureSkipVerify: p.tlsInsecure,
 		}
-		if clientCertFile != "" && clientKeyFile != "" {
-			cert, certErr := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+		if p.clientCertFile != "" && p.clientKeyFile != "" {
+			cert, certErr := tls.LoadX509KeyPair(p.clientCertFile, p.clientKeyFile)
 			if certErr == nil {
 				tlsConf.Certificates = []tls.Certificate{cert}
 			}
@@ -210,11 +224,11 @@ func (p *ECHPool) dialAndServe(ctx context.Context, idx int, ip string) {
 				TLSConfig:         tlsConf,
 				TargetIP:          targetIP,
 				ServerName:        serverName,
-				QUICPort:          quicPort,
+				QUICPort:          p.quicPort,
 				Timeout:           cfg.WSHandshakeTimeout,
 				KeepAliveInterval: 10 * time.Second,
 				MaxIdleTimeout:    30 * time.Second,
-				EnableDatagrams:   enableDatagram,
+				EnableDatagrams:   p.enableDatagram,
 			}
 			sess, err = p.selector.DialSession(ctx, p.wsServerAddr, opts)
 		} else {

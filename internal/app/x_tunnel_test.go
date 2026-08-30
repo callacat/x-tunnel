@@ -8744,8 +8744,16 @@ func TestPreAuthRejectsReplay(t *testing.T) {
 	t.Cleanup(func() { token = oldToken })
 	token = "v3-replay-test-token"
 
-	sessionID := bytes.Repeat([]byte{0x77}, 16)
-	nonce := bytes.Repeat([]byte{0x88}, 32)
+	// Random per-run identifiers: fixed constants poison the process-global
+	// server nonce cache and make repeated runs (go test -count=N) flaky.
+	sessionID := make([]byte, 16)
+	if _, err := rand.Read(sessionID); err != nil {
+		t.Fatalf("rand sessionID: %v", err)
+	}
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("rand nonce: %v", err)
+	}
 	nowTime := time.Now()
 	now := nowTime.Unix()
 	tai64n := encodeTAI64N(nowTime)
