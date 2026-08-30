@@ -203,6 +203,21 @@ func decideForTarget(host string, ip netip.Addr) routeAction {
 	}
 }
 
+// shouldTunnelDNS 是 DNS 解析源专用判定（round45）：仅当域名**明确命中
+// proxy 规则**时走隧道解析（境外视角防污染）；direct 命中、规则未命中、
+// GEO 库未就绪一律返回 false（国内直连解析，保底可达）。
+//
+// 与 decideForTarget 的兜底语义刻意不同：TCP 未命中兜底 proxy（防被墙），
+// DNS 未命中兜底直连解析——r43 曾共用 TCP 语义导致 GEO 库缺失时国内域名
+// 全被推到隧道 DNS，隧道不稳即全断（r44 真机实锤）。
+func shouldTunnelDNS(host string) bool {
+	if routeRT.engineSnapshot() == nil {
+		return false
+	}
+	action, matched := routeRT.match(host, netip.Addr{})
+	return matched && action == route.ActionProxy
+}
+
 // match 对 (host, ip) 做分流判定；引擎为 nil 时恒返回 proxy。
 func (rt *routeRuntime) match(host string, ip netip.Addr) (string, bool) {
 	e := rt.engineSnapshot()

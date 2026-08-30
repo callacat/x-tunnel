@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -450,18 +449,16 @@ func (a *UDPAssociation) send(target string, data []byte) {
 	//   - 引擎未启用（GEO off）→ 保持客户端原目标不动（现状零回归）。
 	host, portStr, _ := net.SplitHostPort(target)
 	if portStr == "53" && routeRT.engineSnapshot() != nil {
-		if qname, ok := sniffDNSQuery(data); ok {
-			if decideForTarget(qname, netip.Addr{}) == routeProxy {
-				// 明确 proxy 的境外域名：走隧道解析（无污染视角）。
-				if rewritten := net.JoinHostPort(tunnelDNSHost, "53"); rewritten != target {
-					target = rewritten
-					host = tunnelDNSHost
-				}
-			} else if host != directDNSHost {
-				// direct 命中 / 未命中 / 库未就绪：国内直连解析（保底可达）。
-				target = net.JoinHostPort(directDNSHost, "53")
-				host = directDNSHost
+		if qname, ok := sniffDNSQuery(data); ok && shouldTunnelDNS(qname) {
+			// 明确 proxy 的境外域名：走隧道解析（无污染视角）。
+			if rewritten := net.JoinHostPort(tunnelDNSHost, "53"); rewritten != target {
+				target = rewritten
+				host = tunnelDNSHost
 			}
+		} else if ok && host != directDNSHost {
+			// direct 命中 / 未命中 / 库未就绪：国内直连解析（保底可达，r45）。
+			target = net.JoinHostPort(directDNSHost, "53")
+			host = directDNSHost
 		}
 	}
 	// round41：UDP 分流判定。GEO 引擎启用且目标判定 direct（国内 DNS/国内 UDP

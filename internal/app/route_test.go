@@ -86,3 +86,32 @@ func newTestRouteEngine(t *testing.T, rulesText string) (*route.Engine, error) {
 	})
 	return engine, nil
 }
+
+// round45：DNS 源分流语义回归——「未命中/库缺失」必须走国内直连解析（保底），
+// 仅明确 proxy 的域名才走隧道解析。r43 反语义在 GEO 库缺失时把国内域名也
+// 推到隧道 DNS，隧道不稳 = 全断（r44 真机实锤）。
+func TestDNSSourceRoutingSemantic(t *testing.T) {
+	// 场景1：GEO 库缺失（只有 domain 规则可命中的引擎）。
+	e, err := newTestRouteEngine(t, "direct,domain:baidu.com\nproxy,domain:github.com\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	// 国内域名（命中 direct）→ 不走隧道解析（直连解析）。
+	if shouldTunnelDNS("www.baidu.com") {
+		t.Fatalf("cn domain: shouldTunnelDNS=true, want false（直连解析）")
+	}
+	// 明确 proxy 的境外域名 → 走隧道解析。
+	if !shouldTunnelDNS("github.com") {
+		t.Fatalf("proxy domain: shouldTunnelDNS=false, want true（隧道解析）")
+	}
+	// 未命中任何规则的域名 → 保底直连解析（不得推隧道，r43 反语义回归）。
+	if shouldTunnelDNS("example.org") {
+		t.Fatalf("unmatched domain: shouldTunnelDNS=true, want false（保底直连）")
+	}
+	// TCP 判定兜底语义保持：未命中仍 proxy（防被墙）——与 DNS 语义刻意不同。
+	if got := decideForTarget("example.org", netip.Addr{}); got != routeProxy {
+		t.Fatalf("tcp unmatched: got %v, want routeProxy（防被墙兜底不变）", got)
+	}
+}
