@@ -802,13 +802,13 @@ func handlePreAuthTransportSession(sess transport.TransportSession, closer io.Cl
 		log.Printf("[服务端] v3 ChannelInit nonce 重放，来源 IP: %s", clientIP)
 		return
 	}
-	if !serverTAI64NCache.CheckAndStore(init.SessionID, init.TAI64N) {
+	if !serverTAI64NCache.CheckAndStore(init.SessionID, init.TAI64N, now, cfg.AuthSkew) {
 		atomic.AddUint64(&serverTAI64NRejectSeq, 1)
 		atomic.AddUint64(&serverProtocolRejectSeq, 1)
 		if closer != nil {
 			_ = closer.Close()
 		}
-		log.Printf("[服务端] v3 ChannelInit TAI64N 重放或非单调递增，来源 IP: %s", clientIP)
+		log.Printf("[服务端] v3 ChannelInit TAI64N 超出新鲜度窗口，来源 IP: %s", clientIP)
 		return
 	}
 	required := requiredProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy

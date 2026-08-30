@@ -1,17 +1,17 @@
 package app
 
 import (
-	"bytes"
 	"container/list"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const defaultTAI64NCacheCapacity = 65536
 
 type tai64nEntry struct {
-	sessionID [16]byte
-	maxTAI64N [12]byte
+	sessionID  [16]byte
+	lastTAI64N [12]byte
 }
 
 type tai64nCache struct {
@@ -32,14 +32,28 @@ func newTAI64NCache(capacity int) *tai64nCache {
 	}
 }
 
-// CheckAndStore checks whether tai64n is strictly greater than the recorded
-// timestamp for the sessionID. If the sessionID does not exist, it inserts it.
-// If the capacity is reached, it evicts the least-recently used entry.
-// Returns true if valid and stored/updated, false if rejected (replay or not strictly greater or invalid lengths).
-func (c *tai64nCache) CheckAndStore(sessionID []byte, tai64n []byte) bool {
-	if len(sessionID) != 16 || len(tai64n) != 12 {
+// CheckAndStore validates the TAI64N timestamp as a freshness window:
+// the decoded timestamp must lie within [now-skew, now+skew]. A skew <= 0
+// disables the check. Out-of-order or identical timestamps are accepted;
+// parallel handshakes from one client share the sessionID (client UUID) and
+// must not be rejected for non-monotonic timestamps. Replay protection is
+// provided by serverNonceCache (keyed with clientNonce).
+//
+// The LRU still tracks the last accepted timestamp per session, but never
+// rejects based on ordering. Returns false only for malformed input or a
+// timestamp outside the freshness window.
+func (c *tai64nCache) CheckAndStore(sessionID []byte, tai64n []byte, now time.Time, skew time.Duration) bool {
+	if len(sessionID) != 16 {
 		return false
 	}
+	decoded, err := decodeTAI64N(tai64n)
+	if err != nil {
+		return false
+	}
+	if skew > 0 && (decoded.Before(now.Add(-skew)) || decoded.After(now.Add(skew))) {
+		return false
+	}
+
 	var sKey [16]byte
 	copy(sKey[:], sessionID)
 	var tVal [12]byte
@@ -50,10 +64,7 @@ func (c *tai64nCache) CheckAndStore(sessionID []byte, tai64n []byte) bool {
 
 	if elem, ok := c.items[sKey]; ok {
 		entry := elem.Value.(*tai64nEntry)
-		if bytes.Compare(tVal[:], entry.maxTAI64N[:]) <= 0 {
-			return false
-		}
-		entry.maxTAI64N = tVal
+		entry.lastTAI64N = tVal
 		c.evict.MoveToFront(elem)
 		return true
 	}
@@ -69,8 +80,8 @@ func (c *tai64nCache) CheckAndStore(sessionID []byte, tai64n []byte) bool {
 	}
 
 	entry := &tai64nEntry{
-		sessionID: sKey,
-		maxTAI64N: tVal,
+		sessionID:  sKey,
+		lastTAI64N: tVal,
 	}
 	elem := c.evict.PushFront(entry)
 	c.items[sKey] = elem

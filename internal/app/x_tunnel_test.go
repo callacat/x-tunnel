@@ -8744,7 +8744,7 @@ func TestPreAuthRejectsReplay(t *testing.T) {
 	}
 }
 
-func TestPreAuthTAI64NMonotonicAntiReplay(t *testing.T) {
+func TestPreAuthTAI64NFreshnessWindow(t *testing.T) {
 	oldToken := token
 	t.Cleanup(func() { token = oldToken })
 	token = "v3-tai64n-monotonic-token"
@@ -8822,14 +8822,16 @@ func TestPreAuthTAI64NMonotonicAntiReplay(t *testing.T) {
 		t.Fatalf("Session A at T2 failed: %v", err)
 	}
 
-	// 3. Session A with T3 (= T2) -> must be rejected silently
-	if err := connectWith(sessionIDA, 3, t3Equal); err == nil {
-		t.Fatalf("Session A at T3 (= T2) should have been rejected silently")
+	// 3. Session A with T3 (= T2), a fresh nonce -> must be accepted
+	// (parallel handshakes may share a nanosecond timestamp; replay protection
+	// against identical nonces is serverNonceCache's job, not the TAI64N cache).
+	if err := connectWith(sessionIDA, 3, t3Equal); err != nil {
+		t.Fatalf("Session A at T3 (= T2) failed: %v", err)
 	}
 
-	// 4. Session A with T4 (< T2) -> must be rejected silently
-	if err := connectWith(sessionIDA, 4, t4Older); err == nil {
-		t.Fatalf("Session A at T4 (< T2) should have been rejected silently")
+	// 4. Session A with T4 (< T2) but still inside the freshness window -> must be accepted
+	if err := connectWith(sessionIDA, 4, t4Older); err != nil {
+		t.Fatalf("Session A at T4 (< T2, in-window) failed: %v", err)
 	}
 
 	// 5. Session B (different identity) with T1 (same as Session A's first timestamp) -> should succeed
@@ -8845,51 +8847,44 @@ func TestPreAuthTAI64NMonotonicAntiReplay(t *testing.T) {
 
 func TestTAI64NCacheLRU(t *testing.T) {
 	cache := newTAI64NCache(2)
+	now := time.Now()
+	skew := 5 * time.Minute
 	s1 := []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
 	s2 := []byte{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2}
 	s3 := []byte{3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3}
 
-	t10 := encodeTAI64N(time.Unix(10, 0).UTC())
-	t20 := encodeTAI64N(time.Unix(20, 0).UTC())
-	t5 := encodeTAI64N(time.Unix(5, 0).UTC())
+	tNew := encodeTAI64N(now)
+	tOlder := encodeTAI64N(now.Add(-time.Second))
 
-	// Insert s1 at t10 -> OK
-	if !cache.CheckAndStore(s1, t10) {
-		t.Fatal("s1 t10 should be accepted")
+	// Insert s1, s2 -> OK
+	if !cache.CheckAndStore(s1, tNew, now, skew) {
+		t.Fatal("s1 should be accepted")
 	}
-	// Insert s2 at t10 -> OK
-	if !cache.CheckAndStore(s2, t10) {
-		t.Fatal("s2 t10 should be accepted")
+	if !cache.CheckAndStore(s2, tNew, now, skew) {
+		t.Fatal("s2 should be accepted")
 	}
 	if cache.Len() != 2 {
 		t.Fatalf("cache len = %d, want 2", cache.Len())
 	}
 
-	// Insert s3 at t10 -> s1 (least recently used) is evicted, s3 inserted
-	if !cache.CheckAndStore(s3, t10) {
-		t.Fatal("s3 t10 should be accepted")
+	// Insert s3 -> s1 (least recently used) is evicted, s3 inserted
+	if !cache.CheckAndStore(s3, tNew, now, skew) {
+		t.Fatal("s3 should be accepted")
 	}
 	if cache.Len() != 2 {
 		t.Fatalf("cache len = %d, want 2", cache.Len())
 	}
 
-	// s2 is still in cache: connecting with t5 (< t10) should fail
-	if cache.CheckAndStore(s2, t5) {
-		t.Fatal("s2 t5 should be rejected as non-monotonic")
-	}
-	// s2 connecting with t20 (> t10) should succeed and move s2 to front
-	if !cache.CheckAndStore(s2, t20) {
-		t.Fatal("s2 t20 should be accepted")
-	}
-
-	// s1 was evicted, so inserting s1 with t5 (< t10) is accepted as a new session
-	if !cache.CheckAndStore(s1, t5) {
-		t.Fatal("evicted s1 at t5 should be accepted as new session")
+	// s2 is still cached: an older timestamp within the skew is accepted
+	// (freshness window, not strict monotonicity) and moves s2 to front.
+	if !cache.CheckAndStore(s2, tOlder, now, skew) {
+		t.Fatal("s2 with in-window older timestamp should be accepted")
 	}
 }
 
 func TestTAI64NCacheConcurrent(t *testing.T) {
 	cache := newTAI64NCache(100)
+	now := time.Now()
 	var wg sync.WaitGroup
 	const goroutines = 16
 	const iterations = 100
@@ -8901,9 +8896,9 @@ func TestTAI64NCacheConcurrent(t *testing.T) {
 			var sKey [16]byte
 			sKey[0] = byte(id)
 			for j := 0; j < iterations; j++ {
-				tm := time.Unix(int64(j+1), 0).UTC()
-				tBytes := encodeTAI64N(tm)
-				_ = cache.CheckAndStore(sKey[:], tBytes)
+				tBytes := encodeTAI64N(now.Add(time.Duration(j) * time.Millisecond))
+				// skew 0 disables freshness; exercises cache concurrency only.
+				_ = cache.CheckAndStore(sKey[:], tBytes, now, 0)
 			}
 		}(i)
 	}
