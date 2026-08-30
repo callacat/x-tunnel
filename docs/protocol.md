@@ -1,12 +1,23 @@
 # x-tunnel Protocol Specification
 
-Status: Protocol v3 (P0 + P1 + P2 implemented; all-AEAD, ephemeral X25519 forward secrecy, server proof, sliding replay window, TAI64N anti-replay, first-packet morphing, per-record padding, traffic shaping, smux keepalive randomization, send pacing, ECH default off/configurable, and configurable cipher preference).
+Status: Protocol v3 (P0 + P1 + P2 + P3 implemented; all-AEAD, ephemeral X25519 forward secrecy, server proof, sliding replay window, TAI64N anti-replay, first-packet morphing, per-record padding, traffic shaping, smux keepalive randomization, send pacing, ECH default off/configurable, configurable cipher preference, dual-stack QUIC/TCP transport, RFC 9221 datagrams, and multi-IP endpoint rotation).
 
 This document describes the wire behavior implemented in `internal/wire` and
-used by `cmd/x-tunnel`. Current builds negotiate and enforce protocol v3
-`ChannelInit` and `ChannelAccept` with mutual authentication and ephemeral
-X25519 forward secrecy. A peer that cannot complete v3 authentication or lacks
-required capabilities fails closed before any client session is created.
+`internal/transport`, and used by `cmd/x-tunnel`. Current builds negotiate and
+enforce protocol v3 `ChannelInit` and `ChannelAccept` with mutual
+authentication and ephemeral X25519 forward secrecy. A peer that cannot
+complete v3 authentication or lacks required capabilities fails closed before
+any client session is created.
+
+Protocol v3 runs identically over two outer transports: WebSocket over
+TCP/TLS (with smux multiplexing) and native IETF QUIC (RFC 9000, with RFC 9221
+datagram support). Transport selection is independent of authentication and
+record-layer cryptography; see Sections 2 and 11.
+
+Additional standards references for the transport layer:
+
+- QUIC: A UDP-Based Multiplexed and Secure Transport: RFC 9000, <https://www.rfc-editor.org/rfc/rfc9000>
+- An Unreliable Datagram Extension to QUIC: RFC 9221, <https://www.rfc-editor.org/rfc/rfc9221>
 
 Standards references used for local proxy behavior:
 
@@ -21,28 +32,48 @@ Standards references used for local proxy behavior:
 x-tunnel has two runtime roles:
 
 - Client mode: starts local SOCKS5, HTTP proxy, and TCP forward listeners, then
-  dials a remote WebSocket server.
-- Server mode: accepts WebSocket connections, authenticates v3 channels, opens
-  smux streams, and dials target TCP/UDP endpoints directly or through an
-  upstream SOCKS5 proxy.
+  dials a remote server over WebSocket (TCP/TLS) or QUIC according to the
+  configured transport mode (`auto`, `quic`, or `tcp`).
+- Server mode: accepts transport sessions, authenticates v3 channels, opens
+  per-channel streams, and dials target TCP/UDP endpoints directly or through
+  an upstream SOCKS5 proxy.
 
-The transport stack is:
+The transport stack for the TCP/WSS transport is:
 
 ```text
 local app
   -> local SOCKS5 / HTTP / TCP listener
-  -> smux stream (v3 AEAD encrypted)
+  -> stream (v3 AEAD encrypted)
   -> smux session
   -> WebSocket connection
   -> TLS 1.3 transport
 ```
 
-Every smux stream carries an independent AEAD encrypted channel after
-handshake negotiation.
+The QUIC transport replaces the smux and WebSocket layers with native QUIC
+streams, eliminating TCP head-of-line blocking on the outer transport:
 
-## 2. WebSocket Transport
+```text
+local app
+  -> local SOCKS5 / HTTP / TCP listener
+  -> QUIC stream (v3 AEAD encrypted)
+  -> QUIC connection (native stream multiplexing)
+  -> QUIC over UDP (outer encryption and congestion control)
+```
 
-The outer transport is WebSocket over TCP or TLS:
+Every stream carries an independent AEAD encrypted channel after
+handshake negotiation. The v3 handshake, key schedule, and record layer are
+byte-identical across both transports; only the framing substrate differs.
+
+## 2. Outer Transports
+
+Two outer transports are supported behind the `internal/transport`
+abstraction (`Transport`, `TransportSession`, `TransportStream`,
+`TransportListener`). The v3 channel handshake (Section 3) is performed on the
+first stream of a session identically for both transports.
+
+### 2.1 WebSocket over TCP/TLS
+
+The TCP transport carries a WebSocket connection multiplexed by smux:
 
 - `ws://`
 - `wss://`
@@ -67,10 +98,49 @@ leaving Go's default `Go-http-client` value on the upgrade request. This is
 request-shape hygiene only; it does not carry protocol state and does not change
 the TCP/UDP data path.
 
+### 2.2 QUIC Transport (RFC 9000)
+
+The QUIC transport is a native IETF QUIC stack built on
+`github.com/quic-go/quic-go`. It replaces WebSocket + smux with QUIC streams
+and removes TCP head-of-line blocking between channels and streams.
+
+Wire and TLS parameters:
+
+- QUIC v1 over UDP with TLS 1.3 (`quic.DialAddr` / `quic.ListenAddr`).
+- ALPN protocol identifier: `xtunnel-v3`.
+- RFC 9221 datagram extension is negotiated (`EnableDatagrams: true`) on both
+  client and server.
+- Default address resolution: the URL scheme and path are stripped; if no port
+  is present, `443` is assumed. The client-side `-quic-port` option overrides
+  the dial port separately from the main server port, supporting split-port
+  server deployments.
+- `-server-ip` / `DialOptions.TargetIP` forces the dial address to a specific
+  IP while keeping the configured TLS `ServerName` for the certificate check.
+
+Connection management defaults (`quic.Config`):
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `HandshakeIdleTimeout` | `5s` | Abandons a stalled handshake. |
+| `MaxIdleTimeout` | `30s` | Closes the connection after inactivity without packets. |
+| `KeepAlivePeriod` | `10s` | Client-side PING frames keep NAT bindings alive. |
+| `MaxIncomingStreams` | server-configured | Per-connection concurrent stream limit (server side). |
+
+Sessions are closed with `CloseWithError(0, "normal close")` on clean
+shutdown. QUIC connection IDs are unstable in transit and connections are not
+intended to survive client IP changes beyond QUIC's own connection migration
+behavior; a broken connection is re-dialed under the channel pool logic.
+
+After the QUIC handshake completes, the client opens the first QUIC stream
+and runs the v3 `ChannelInit` / `ChannelAccept` exchange exactly as over a
+smux stream. The UDP relay path optionally uses RFC 9221 datagrams instead of
+reliable streams; see Section 11.3.
+
 ## 3. Protocol v3 Channel Authentication and Cryptography
 
-Each WebSocket channel carries one smux session. Immediately after smux setup,
-the client opens the first stream and sends a v3 frame:
+Each channel is one multiplexed session: a smux session over WebSocket for the
+TCP transport, or a native QUIC connection for the QUIC transport. Immediately
+after session setup, the client opens the first stream and sends a v3 frame:
 
 ```text
 frame_type (u8) | version (u8) | flags (BE16) | body_len (BE32) | body ...
@@ -239,7 +309,7 @@ To eliminate first-packet length fingerprinting (a primary classification signal
 
 ### 3.7 Per-Stream AEAD Framing, Per-Record Padding, and Traffic Shaping (P1)
 
-Data streams within smux are wrapped with `V3CipherStream`:
+Data streams within a session are wrapped with `V3CipherStream`:
 
 ```text
 counter (BE64) | plain_len (BE16) | pad_len (BE16) | AEAD(plain || pad || tag)
@@ -281,7 +351,7 @@ The pre-auth stage is bounded by `-preauth-timeout` (default `5s`).
 
 ### 3.9 Silent Drop Behavior and Observability
 
-To prevent protocol fingerprinting and timing oracles, any failure during pre-auth validation does not send a `ChannelReject` frame. Instead, the server **silently drops** the connection by immediately closing the underlying WebSocket connection.
+To prevent protocol fingerprinting and timing oracles, any failure during pre-auth validation does not send a `ChannelReject` frame. Instead, the server **silently drops** the connection by immediately closing the underlying transport connection (WebSocket or QUIC).
 - **External View**: Handshake failures and network disconnects are indistinguishable to unauthenticated probes.
 - **Local Observability**: Specific failure reasons are recorded in server logs and exposed via internal Prometheus metrics (`x_tunnel_server_auth_rejections_total`, `x_tunnel_server_tai64n_rejections_total`, `x_tunnel_server_tai64n_lru_evictions_total`, etc.) for operations and troubleshooting.
 
@@ -295,8 +365,10 @@ To prevent protocol fingerprinting and timing oracles, any failure during pre-au
   - ECH default off / configurable (`-ech` bool flag default false, `-ech-domain` string, rationale: GFW targeted blocking).
   - Configurable client cipher preference (`-cipher-pref`, default "1,2,3", validated against supported ciphers, fail closed on error).
   - Segmentation coalescing switch wiring (`-shaping-coalesce-ms`, default 0 / disabled to avoid adding interactive latency; ping probe streams keep 0 delay to avoid RTT measurement distortion).
-- **Remaining Items**:
-  - Dual-stack QUIC / HTTP/3 transport alongside WebSocket/TCP.
+- **P3 (Implemented)**: Multi-IP endpoint rotation with failure tracking and
+  block detection (`EndpointPool`, Section 11.4), optional idle cover traffic
+  (Section 11.5), and the dual-stack QUIC/TCP transport with RFC 9221 datagram
+  UDP relay (Section 11).
 
 ## 4. Capabilities
 
@@ -320,10 +392,11 @@ Runtime requirements:
 - In protocol v3, `TCP`, `Ping`, `TCPStatus`, `OpenStatusCode`, and `ForwardSecrecy` are required bits.
 - Peers that do not advertise required bits are rejected with `MissingRequiredCapability` (code 2), failing closed.
 
-## 5. smux Stream Open Header
+## 5. Stream Open Header
 
-After channel authentication, every data stream starts with the compact
-open header (carried inside the AEAD encrypted payload):
+After channel authentication, every data stream (smux sub-stream or QUIC
+stream) starts with the compact open header, carried inside the AEAD
+encrypted payload:
 
 ```text
 kind (u8) | ip_strategy (u8) | target_len (BE16) | target bytes ...
@@ -402,7 +475,9 @@ UDP connectivity or an upstream SOCKS5 UDP association, and writes:
 status (u8) | code (u8) | msg_len (BE16) | message bytes ...
 ```
 
-After OK, UDP packets are framed in both directions.
+After OK, UDP packets are framed in both directions. The framings below apply
+to stream-based UDP relay; over the QUIC transport, UDP relay may instead use
+RFC 9221 datagrams as described in Section 11.3.
 
 ### Client-to-Server Datagrams
 
@@ -423,7 +498,7 @@ match replies against the active UDP association.
 
 ## 8. Ping Streams
 
-Ping streams measure application RTT through the smux channel:
+Ping streams measure application RTT through the channel:
 
 - The client sends 8 random bytes.
 - The server echoes the 8 bytes back.
@@ -439,7 +514,7 @@ immediately after the 4-byte stream open header.
 - Supports `NO AUTHENTICATION REQUIRED` (`0x00`).
 - Supports `CONNECT` (`0x01`) and `UDP ASSOCIATE` (`0x03`).
 - Rejects `BIND` with `Command not supported` (`0x07`).
-- Binds a dedicated smux stream per TCP connection and per UDP associate.
+- Binds a dedicated channel stream per TCP connection and per UDP associate.
 
 ### HTTP Proxy
 
@@ -479,20 +554,91 @@ Successful CONNECT returns `HTTP/1.1 200 Connection Established` without
 - Server-side egress policy is pre-dial: CIDR rules apply to literal IP targets,
   and host rules apply to literal domain targets before DNS resolution.
 
-## 11. Dual-Stack Transport Architecture (QUIC + TCP/WSS) & RFC 9221 Datagram
+## 11. Dual-Stack Transport Architecture (QUIC + TCP/WSS)
 
-### Dual-Stack Selection and Auto-Fallback
-- **Modes**: `auto` (default), `quic`, `tcp`.
-- **Auto Mode**: Probes QUIC first with a 1.5s fallback deadline (`quicFallbackTimeout`).
-- **Host Memory Cache**: Caches connection success/failure per endpoint host. If QUIC fails repeatedly, automatic cooldown prevents redundant connection delays and connects via TCP/WSS directly while probing in the background.
-- **Transport Abstraction**: Core v3 authentication and AEAD recording layers operate on top of `transport.TransportSession` and `transport.TransportStream`, cleanly decoupling transport protocols from encryption and application logic.
+### 11.1 Transport Abstraction
 
-### RFC 9221 QUIC Datagram Framing
-- Format: `AssocID (2B) + PktID (2B) + FragTotal (1B) + FragID (1B) + PayloadLen (2B) + AddrType (1B) + TargetAddr (var) + TargetPort (2B) + Payload (var)`.
-- Reassembler: Multi-fragment datagrams are reassembled with bounded capacity and TTL eviction.
+All channel-level logic (v3 authentication, key derivation, `V3CipherStream`
+record layer, TCP/UDP/Ping stream semantics) operates on the
+`internal/transport` interfaces (`Transport`, `TransportSession`,
+`TransportStream`, `TransportListener`) and is transport-agnostic. Two
+concrete transports exist:
 
-### Multi-IP Rotation & Block Detection (P3)
-- `EndpointPool` maintains multiple server IPs, monitors connection health, auto-demotes failed IPs with circuit-breaking cooldown, and rotates across available healthy endpoints.
+| Transport | Session substrate | Stream substrate | Datagram support |
+| --- | --- | --- | --- |
+| `TcpTransport` | WebSocket (ws/wss) + smux | smux stream | Not supported (`ErrDatagramNotSupported`) |
+| `QuicTransport` | QUIC connection (RFC 9000) | QUIC bidirectional stream | RFC 9221 datagrams |
+
+### 11.2 Dual-Stack Selection and Auto-Fallback
+
+The client-side `TransportSelector` picks the outer transport per dial:
+
+- **Modes**: `auto` (default), `quic`, `tcp` (CLI `-transport`).
+- **Auto mode probing order**: QUIC is attempted first with a
+  `DefaultQUICFallbackTimeout` of `1.5 s`; if the effective dial timeout is
+  shorter, the shorter value wins. On QUIC success the session is used
+  immediately; on failure or timeout the client falls back to TCP/WSS.
+- **Host memory cache** (`HostMemoryCache`): per-host connection history.
+  After `MaxConsecutiveFails` (`2`) consecutive QUIC failures for a host, the
+  host prefers TCP and is cooled down for `DefaultHostCooldown` (`5 min`);
+  during the cooldown, auto mode dials TCP/WSS directly without paying the
+  QUIC probe cost. After the cooldown expires, QUIC is probed again
+  (background recovery). A QUIC success resets the failure counter and
+  restores QUIC preference.
+
+### 11.3 RFC 9221 QUIC Datagram Framing
+
+UDP relay over QUIC optionally uses unreliable QUIC datagrams (RFC 9221)
+instead of reliable streams, preserving UDP message boundaries and avoiding
+retransmission-induced latency. Datagram framing (`internal/transport/datagram.go`):
+
+```text
+AssocID (2B) | PktID (2B) | FragTotal (1B) | FragID (1B) | PayloadLen (2B)
+| AddrType (1B) | TargetAddr (var) | TargetPort (2B) | Payload (var)
+```
+
+- `AssocID` identifies the local UDP association; `PktID` identifies the
+  logical datagram within the association. Together they form the reassembly
+  key `(AssocID << 16) | PktID`.
+- `AddrType` follows SOCKS5 address type conventions: `0x01` IPv4 (4 B),
+  `0x03` domain name (`len(1B)` + bytes, `len <= 255`), `0x04` IPv6 (16 B).
+- `FragTotal == 0` on the wire is treated as `1`; a frame with
+  `FragTotal <= 1` is complete on arrival.
+- **Limits**: `MaxDatagramSize = 1400` B, safe-path MTU `DefaultMTU = 1200` B.
+- **Fragmentation**: oversized datagrams are split into at most `255`
+  fragments. Each fragment repeats the full header and carries its slice of
+  the payload with a per-fragment `PayloadLen`.
+- **Reassembly**: `DatagramReassembler` buffers fragments per key with a
+  TTL (`default 5 s`) and a bounded queue (`default 1024` pending datagrams).
+  Expired entries are evicted lazily on insert; a full queue rejects new
+  multi-fragment datagrams (`ErrReassemblerQueueFull`) instead of growing
+  without bound. Complete datagrams are reassembled in fragment-index order
+  and delivered once.
+
+### 11.4 Multi-IP Rotation and Block Detection (P3)
+
+`EndpointPool` maintains the set of server IP endpoints for channels dialed
+with `-server-ip` rotation (CLI/server list):
+
+- Each endpoint tracks `ConsecutiveFails`, total success/failure counters,
+  `LastRTT`, and a `Healthy` flag.
+- An endpoint is marked unhealthy after `failThreshold` consecutive failures
+  (default `3`) and enters circuit-breaker cooldown (default `60 s`).
+- Round-robin selection skips unhealthy endpoints until their cooldown
+  expires, after which an endpoint is returned in a half-open probation state
+  (immediately marked healthy again so a single probe can either recover it
+  or re-trip it).
+- If every endpoint is unhealthy and none has cooled down, selection falls
+  back to the least-recently-failed endpoint rather than failing the dial.
+- Channel RTT probe results feed `RecordResult`, so steady-state health
+  reflects measured latency and probing outcomes, not just dial success.
+
+### 11.5 Idle Cover Traffic (P3)
+
+With `-cover-traffic` enabled, each established channel emits cover activity
+during idle periods: a `20 s` ticker performs an RTT probe on the channel,
+producing periodic short authenticated exchanges that blur strictly
+application-driven idle/active boundaries. It is disabled by default.
 
 ## 12. Evolution Rules
 
