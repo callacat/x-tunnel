@@ -13,8 +13,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/xtaci/smux"
 )
 
 type ProxyConfig struct {
@@ -34,7 +32,7 @@ type UDPAssociation struct {
 	active    bool
 	channelID int
 	target    string
-	stream    *smux.Stream
+	stream    *V3CipherStream
 }
 
 func parseAuthAndAddr(full string) (string, string, string, error) {

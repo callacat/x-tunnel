@@ -126,7 +126,7 @@ func TestLocalTunnelIntegration(t *testing.T) {
 	waitTCP(t, ctx, httpProxyAddr, client)
 	waitTCP(t, ctx, clientMetricsAddr, client)
 	waitLogContains(t, ctx, clientLog, "协议协商成功", client)
-	waitLogContains(t, ctx, serverLog, "v2 客户端通道", server)
+	waitLogContains(t, ctx, serverLog, "v3 客户端通道", server)
 
 	assertBody(t, "tcp forward", fetchHTTP(t, "http://"+tcpAddr+"/payload"), body)
 	assertBody(t, "http proxy", fetchViaHTTPProxy(t, httpProxyAddr, "http://"+targetAddr+"/payload"), body)
@@ -158,8 +158,8 @@ func TestLocalTunnelIntegration(t *testing.T) {
 		"-n", "1",
 	)
 	defer stopProcess(badClient)
-	waitLogContains(t, ctx, badClientLog, "认证失败", badClient)
-	waitLogContains(t, ctx, serverLog, "v2 认证失败", server)
+	waitLogContains(t, ctx, badClientLog, "协议协商失败", badClient)
+	waitLogContains(t, ctx, serverLog, "v3 认证失败", server)
 	assertMetricValue(t, fetchHTTP(t, "http://"+metricsAddr+"/metrics"), "x_tunnel_server_auth_rejections_total", "1")
 }
 
@@ -234,7 +234,7 @@ func TestLocalTunnelWithWebSocketFrontProxyIntegration(t *testing.T) {
 	waitTCP(t, ctx, socksAddr, client)
 	waitLogContains(t, ctx, clientLog, "WebSocket 前置代理已启用", client)
 	waitLogContains(t, ctx, clientLog, "协议协商成功", client)
-	waitLogContains(t, ctx, serverLog, "v2 客户端通道", server)
+	waitLogContains(t, ctx, serverLog, "v3 客户端通道", server)
 
 	req := <-connectRequests
 	if req.Method != http.MethodConnect {
@@ -316,8 +316,8 @@ func TestIntegrationSimulatedCensorProxyAllowsV2Tunnel(t *testing.T) {
 	defer stopProcess(client)
 	waitTCP(t, ctx, socksAddr, client)
 	waitTCP(t, ctx, tcpAddr, client)
-	waitLogContains(t, ctx, clientLog, "v2 协议协商成功", client)
-	waitLogContains(t, ctx, serverLog, "v2 客户端通道", server)
+	waitLogContains(t, ctx, clientLog, "v3 协议协商成功", client)
+	waitLogContains(t, ctx, serverLog, "v3 客户端通道", server)
 
 	assertBody(t, "censor socks5", fetchViaSOCKS5(t, socksAddr, targetAddr, "/payload"), body)
 	assertBody(t, "censor tcp forward", fetchHTTP(t, "http://"+tcpAddr+"/payload"), body)
@@ -377,7 +377,7 @@ func TestIntegrationLocalProxyAuth(t *testing.T) {
 	waitTCP(t, ctx, socksAddr, client)
 	waitTCP(t, ctx, httpProxyAddr, client)
 	waitLogContains(t, ctx, clientLog, "协议协商成功", client)
-	waitLogContains(t, ctx, serverLog, "v2 客户端通道", server)
+	waitLogContains(t, ctx, serverLog, "v3 客户端通道", server)
 
 	assertHTTPProxyAuthChallenge(t, "HTTP proxy without auth", fetchViaHTTPProxyAuthChallenge(t, httpProxyAddr, "http://"+targetAddr+"/payload", "", ""))
 	assertHTTPProxyAuthChallenge(t, "HTTP proxy wrong auth", fetchViaHTTPProxyAuthChallenge(t, httpProxyAddr, "http://"+targetAddr+"/payload", "user", "wrong"))
@@ -527,7 +527,7 @@ func TestIntegrationLocalWSSFallback(t *testing.T) {
 	waitTCP(t, ctx, tcpAddr, client)
 	waitLogContains(t, ctx, clientLog, "fallback 模式已启用", client)
 	waitLogContains(t, ctx, clientLog, "协议协商成功", client)
-	waitLogContains(t, ctx, serverLog, "v2 客户端通道", server)
+	waitLogContains(t, ctx, serverLog, "v3 客户端通道", server)
 
 	assertBody(t, "wss tcp forward", fetchHTTP(t, "http://"+tcpAddr+"/payload"), body)
 }
@@ -589,7 +589,7 @@ func TestIntegrationLocalWSSMTLS(t *testing.T) {
 	defer stopProcess(client)
 	waitTCP(t, ctx, tcpAddr, client)
 	waitLogContains(t, ctx, clientLog, "协议协商成功", client)
-	waitLogContains(t, ctx, serverLog, "v2 客户端通道", server)
+	waitLogContains(t, ctx, serverLog, "v3 客户端通道", server)
 
 	assertBody(t, "wss mtls tcp forward", fetchHTTP(t, "http://"+tcpAddr+"/payload"), body)
 }
@@ -648,7 +648,7 @@ func TestIntegrationMaxClientsRejectsNewClient(t *testing.T) {
 	)
 	defer stopProcess(secondClient)
 	waitTCP(t, ctx, secondSocksAddr, secondClient)
-	waitLogContains(t, ctx, serverLog, "拒绝 v2 客户端会话", server)
+	waitLogContains(t, ctx, serverLog, "拒绝 v3 客户端会话", server)
 	waitLogContains(t, ctx, secondClientLog, "协议协商失败", secondClient)
 	assertMetricValue(t, fetchHTTP(t, "http://"+metricsAddr+"/metrics"), "x_tunnel_server_client_session_rejections_total", "1")
 	assertBody(t, "first client after max-clients rejection", fetchViaSOCKS5(t, firstSocksAddr, targetAddr, "/payload"), body)
@@ -2098,4 +2098,48 @@ func writePEMFile(t *testing.T, path, blockType string, bytes []byte) {
 	if err := pem.Encode(f, &pem.Block{Type: blockType, Bytes: bytes}); err != nil {
 		t.Fatalf("write PEM %s: %v", path, err)
 	}
+}
+
+func TestIntegrationV3TunnelSmoke(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const body = "x-tunnel v3 smoke payload\n"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer origin.Close()
+	targetAddr := strings.TrimPrefix(origin.URL, "http://")
+
+	binPath := buildIntegrationBinary(t, ctx)
+	wsAddr := freeTCPAddr(t)
+	socksAddr := freeTCPAddr(t)
+
+	serverLog := filepath.Join(t.TempDir(), "server.log")
+	clientLog := filepath.Join(t.TempDir(), "client.log")
+
+	server := startXTunnel(t, ctx, binPath, serverLog,
+		"-l", "ws://"+wsAddr+"/tunnel",
+		"-token", "v3-smoke-token",
+	)
+	defer stopProcess(server)
+	waitTCP(t, ctx, wsAddr, server)
+
+	client := startXTunnel(t, ctx, binPath, clientLog,
+		"-l", "socks5://"+socksAddr,
+		"-f", "ws://"+wsAddr+"/tunnel",
+		"-token", "v3-smoke-token",
+		"-n", "1",
+	)
+	defer stopProcess(client)
+	waitTCP(t, ctx, socksAddr, client)
+
+	waitLogContains(t, ctx, clientLog, "cipher=ChaCha20-Poly1305", client)
+	waitLogContains(t, ctx, serverLog, "cipher=ChaCha20-Poly1305", server)
+
+	assertBody(t, "socks5 connect", fetchViaSOCKS5(t, socksAddr, targetAddr, "/payload"), body)
 }

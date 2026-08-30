@@ -153,8 +153,19 @@ var (
 	formatConfigFile    string
 
 	dnsServer string
+	enableECH bool
 	echDomain string
 	fallback  bool
+
+	cipherPrefStr        string
+	pacingRateMbps       float64
+	shapingCoalesceMs    int
+	configuredCipherPref []byte
+
+	transportMode  string
+	quicPort       int
+	enableDatagram bool
+	coverTraffic   bool
 
 	echListMu sync.RWMutex
 	echList   []byte
@@ -183,6 +194,8 @@ var (
 	serverProtocolRejectSeq    uint64
 	serverProtocolFailureSeq   uint64
 	serverProtocolReplaySeq    uint64
+	serverTAI64NRejectSeq      uint64
+	serverTAI64NEvictSeq       uint64
 	clientProtocolOKSeq        uint64
 	clientProtocolFailureSeq   uint64
 	clientRTTProbeFailureSeq   uint64
@@ -240,8 +253,16 @@ func init() {
 	flag.IntVar(&maxClientSessions, "max-clients", 0, "服务端允许的最大并发客户端会话数（0 表示不限制）")
 	flag.IntVar(&maxStreamsPerClient, "max-streams", 0, "服务端每个客户端允许的最大并发 smux stream 数（0 表示不限制）")
 	flag.StringVar(&dnsServer, "dns", "https://doh.pub/dns-query", "查询 ECH 公钥所用的 DNS 服务器 (支持 DoH 或 UDP，仅 wss 模式生效)")
-	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "用于查询 ECH 公钥的域名（仅 wss 模式生效）")
+	flag.BoolVar(&enableECH, "ech", false, "是否启用 ECH (Encrypted Client Hello，仅 wss 模式生效，默认 false)")
+	flag.StringVar(&echDomain, "ech-domain", "cloudflare-ech.com", "用于查询 ECH 公钥的域名（仅 wss 模式且启用 ECH 时生效）")
 	flag.BoolVar(&fallback, "fallback", false, "是否禁用 ECH 并回落到普通 TLS 1.3（仅 wss 模式生效，默认 false）")
+	flag.StringVar(&cipherPrefStr, "cipher-pref", "1,2,3", "客户端 v3 cipher 偏好列表（逗号分隔的算法 ID，如 1,2,3）")
+	flag.Float64Var(&pacingRateMbps, "pacing-rate-mbps", 0, "客户端发送端 pacing 速率 (Mbps，0 表示禁用)")
+	flag.IntVar(&shapingCoalesceMs, "shaping-coalesce-ms", 0, "客户端小包合并延迟上限 (毫秒，0 表示禁用合并)")
+	flag.StringVar(&transportMode, "transport", "auto", "传输层模式 (auto: 优先 QUIC 自动回退 TCP/WSS | quic: 仅 QUIC | tcp: 仅 TCP/WSS)")
+	flag.IntVar(&quicPort, "quic-port", 0, "服务端 QUIC 独立监听端口；客户端拨号 QUIC 时也使用该端口 (0 表示复用主端口的 UDP)")
+	flag.BoolVar(&enableDatagram, "enable-datagram", true, "是否启用 RFC 9221 QUIC Datagram 进行原生 UDP 代理")
+	flag.BoolVar(&coverTraffic, "cover-traffic", false, "是否启用连接空闲时的 cover traffic 拟形混淆")
 	flag.IntVar(&connectionNum, "n", 3, "每个IP建立的WebSocket连接数量")
 	flag.StringVar(&ips, "ips", "", "服务端解析目标地址的IP偏好 (仅客户端有效)\n 4: 仅IPv4\n 6: 仅IPv6\n 4,6: IPv4优先\n 6,4: IPv6优先")
 	flag.StringVar(&controlAddr, "control", "", "可选本地控制 API 监听地址，如 127.0.0.1:0")
@@ -268,52 +289,68 @@ func versionString() string {
 }
 
 type FileConfig struct {
-	Listen              *string                    `json:"listen"`
-	Forward             *string                    `json:"forward"`
-	IP                  *string                    `json:"ip"`
-	Block               *string                    `json:"block"`
-	Cert                *string                    `json:"cert"`
-	Key                 *string                    `json:"key"`
-	ClientCA            *string                    `json:"client_ca"`
-	ClientCert          *string                    `json:"client_cert"`
-	ClientKey           *string                    `json:"client_key"`
-	ClientCAFlag        *string                    `json:"client-ca"`
-	ClientCertFlag      *string                    `json:"client-cert"`
-	ClientKeyFlag       *string                    `json:"client-key"`
-	Token               *string                    `json:"token"`
-	Metrics             *string                    `json:"metrics"`
-	CIDR                *string                    `json:"cidr"`
-	AllowTarget         *string                    `json:"allow_target"`
-	DenyTarget          *string                    `json:"deny_target"`
-	AllowHost           *string                    `json:"allow_host"`
-	DenyHost            *string                    `json:"deny_host"`
-	AllowTargetFlag     *string                    `json:"allow-target"`
-	DenyTargetFlag      *string                    `json:"deny-target"`
-	AllowHostFlag       *string                    `json:"allow-host"`
-	DenyHostFlag        *string                    `json:"deny-host"`
-	MaxClients          *int                       `json:"max_clients"`
-	MaxClientsFlag      *int                       `json:"max-clients"`
-	MaxStreams          *int                       `json:"max_streams"`
-	MaxStreamsFlag      *int                       `json:"max-streams"`
-	DNS                 *string                    `json:"dns"`
-	ECH                 *string                    `json:"ech"`
-	IPS                 *string                    `json:"ips"`
-	Connections         *int                       `json:"connections"`
-	Insecure            *bool                      `json:"insecure"`
-	Fallback            *bool                      `json:"fallback"`
-	WebSocketFrontProxy *WebSocketFrontProxyConfig `json:"websocket_front_proxy"`
-	DialTimeout         *string                    `json:"dial_timeout"`
-	WSHandshakeTimeout  *string                    `json:"ws_handshake_timeout"`
-	ReconnectDelay      *string                    `json:"reconnect_delay"`
-	ReconnectMaxDelay   *string                    `json:"reconnect_max_delay"`
-	ReconnectJitter     *string                    `json:"reconnect_jitter"`
-	RTTProbeTimeout     *string                    `json:"rtt_timeout"`
-	DNSQueryTimeout     *string                    `json:"dns_timeout"`
-	ECHRetryDelay       *string                    `json:"ech_retry_delay"`
-	UDPReadTimeout      *string                    `json:"udp_read_timeout"`
-	ShutdownTimeout     *string                    `json:"shutdown_timeout"`
-	AuthSkew            *string                    `json:"auth_skew"`
-	PreAuthTimeout      *string                    `json:"preauth_timeout"`
+	Listen                *string                    `json:"listen"`
+	Forward               *string                    `json:"forward"`
+	IP                    *string                    `json:"ip"`
+	Block                 *string                    `json:"block"`
+	Cert                  *string                    `json:"cert"`
+	Key                   *string                    `json:"key"`
+	ClientCA              *string                    `json:"client_ca"`
+	ClientCert            *string                    `json:"client_cert"`
+	ClientKey             *string                    `json:"client_key"`
+	ClientCAFlag          *string                    `json:"client-ca"`
+	ClientCertFlag        *string                    `json:"client-cert"`
+	ClientKeyFlag         *string                    `json:"client-key"`
+	Token                 *string                    `json:"token"`
+	Metrics               *string                    `json:"metrics"`
+	CIDR                  *string                    `json:"cidr"`
+	AllowTarget           *string                    `json:"allow_target"`
+	DenyTarget            *string                    `json:"deny_target"`
+	AllowHost             *string                    `json:"allow_host"`
+	DenyHost              *string                    `json:"deny_host"`
+	AllowTargetFlag       *string                    `json:"allow-target"`
+	DenyTargetFlag        *string                    `json:"deny-target"`
+	AllowHostFlag         *string                    `json:"allow-host"`
+	DenyHostFlag          *string                    `json:"deny-host"`
+	MaxClients            *int                       `json:"max_clients"`
+	MaxClientsFlag        *int                       `json:"max-clients"`
+	MaxStreams            *int                       `json:"max_streams"`
+	MaxStreamsFlag        *int                       `json:"max-streams"`
+	DNS                   *string                    `json:"dns"`
+	ECH                   *bool                      `json:"ech"`
+	ECHDomain             *string                    `json:"ech_domain"`
+	ECHDomainFlag         *string                    `json:"ech-domain"`
+	IPS                   *string                    `json:"ips"`
+	Connections           *int                       `json:"connections"`
+	Insecure              *bool                      `json:"insecure"`
+	Fallback              *bool                      `json:"fallback"`
+	CipherPref            *string                    `json:"cipher_pref"`
+	CipherPrefFlag        *string                    `json:"cipher-pref"`
+	PacingRateMbps        *float64                   `json:"pacing_rate_mbps"`
+	PacingRateMbpsFlag    *float64                   `json:"pacing-rate-mbps"`
+	ShapingCoalesceMs     *int                       `json:"shaping_coalesce_ms"`
+	ShapingCoalesceMsFlag *int                       `json:"shaping-coalesce-ms"`
+	Transport             *string                    `json:"transport"`
+	TransportFlag         *string                    `json:"transport_mode"`
+	QuicPort              *int                       `json:"quic_port"`
+	QuicPortFlag          *int                       `json:"quic-port"`
+	EnableDatagram        *bool                      `json:"enable_datagram"`
+	EnableDatagramFlag    *bool                      `json:"enable-datagram"`
+	CoverTraffic          *bool                      `json:"cover_traffic"`
+	CoverTrafficFlag      *bool                      `json:"cover-traffic"`
+	WebSocketFrontProxy   *WebSocketFrontProxyConfig `json:"websocket_front_proxy"`
+	DialTimeout           *string                    `json:"dial_timeout"`
+	WSHandshakeTimeout    *string                    `json:"ws_handshake_timeout"`
+	ReconnectDelay        *string                    `json:"reconnect_delay"`
+	ReconnectMaxDelay     *string                    `json:"reconnect_max_delay"`
+	ReconnectJitter       *string                    `json:"reconnect_jitter"`
+	RTTProbeTimeout       *string                    `json:"rtt_timeout"`
+	DNSQueryTimeout       *string                    `json:"dns_timeout"`
+	ECHRetryDelay         *string                    `json:"ech_retry_delay"`
+	UDPReadTimeout        *string                    `json:"udp_read_timeout"`
+	ShutdownTimeout       *string                    `json:"shutdown_timeout"`
+	AuthSkew              *string                    `json:"auth_skew"`
+	PreAuthTimeout        *string                    `json:"preauth_timeout"`
 }
 
 func visitedFlags() map[string]bool {
@@ -349,8 +386,16 @@ type runtimeValues struct {
 	Insecure            bool
 	IPS                 string
 	DNSServer           string
+	EnableECH           bool
 	ECHDomain           string
 	Fallback            bool
+	CipherPref          string
+	PacingRateMbps      float64
+	ShapingCoalesceMs   int
+	TransportMode       string
+	QuicPort            int
+	EnableDatagram      bool
+	CoverTraffic        bool
 	Global              GlobalConfig
 	WebSocketFrontProxy WebSocketFrontProxyConfig
 }
@@ -385,8 +430,16 @@ func currentRuntimeValues() runtimeValues {
 		Insecure:            insecure,
 		IPS:                 ips,
 		DNSServer:           dnsServer,
+		EnableECH:           enableECH,
 		ECHDomain:           echDomain,
 		Fallback:            fallback,
+		CipherPref:          cipherPrefStr,
+		PacingRateMbps:      pacingRateMbps,
+		ShapingCoalesceMs:   shapingCoalesceMs,
+		TransportMode:       transportMode,
+		QuicPort:            quicPort,
+		EnableDatagram:      enableDatagram,
+		CoverTraffic:        coverTraffic,
 		Global:              cfg,
 		WebSocketFrontProxy: cloneWebSocketFrontProxyConfig(websocketFrontProxyConfig),
 	}
@@ -394,12 +447,21 @@ func currentRuntimeValues() runtimeValues {
 
 func defaultRuntimeValues() runtimeValues {
 	return runtimeValues{
-		UDPBlockPortsStr: "443",
-		CIDRs:            "0.0.0.0/0,::/0",
-		ConnectionNum:    3,
-		DNSServer:        "https://doh.pub/dns-query",
-		ECHDomain:        "cloudflare-ech.com",
-		Global:           defaultGlobalConfig(),
+		UDPBlockPortsStr:  "443",
+		CIDRs:             "0.0.0.0/0,::/0",
+		ConnectionNum:     3,
+		DNSServer:         "https://doh.pub/dns-query",
+		EnableECH:         false,
+		ECHDomain:         "cloudflare-ech.com",
+		Fallback:          false,
+		CipherPref:        "1,2,3",
+		PacingRateMbps:    0,
+		ShapingCoalesceMs: 0,
+		TransportMode:     "auto",
+		QuicPort:          0,
+		EnableDatagram:    true,
+		CoverTraffic:      false,
+		Global:            defaultGlobalConfig(),
 	}
 }
 
@@ -426,8 +488,16 @@ func (values runtimeValues) applyGlobals() {
 	insecure = values.Insecure
 	ips = values.IPS
 	dnsServer = values.DNSServer
+	enableECH = values.EnableECH
 	echDomain = values.ECHDomain
 	fallback = values.Fallback
+	cipherPrefStr = values.CipherPref
+	pacingRateMbps = values.PacingRateMbps
+	shapingCoalesceMs = values.ShapingCoalesceMs
+	transportMode = values.TransportMode
+	quicPort = values.QuicPort
+	enableDatagram = values.EnableDatagram
+	coverTraffic = values.CoverTraffic
 	cfg = values.Global
 	websocketFrontProxyConfig = cloneWebSocketFrontProxyConfig(values.WebSocketFrontProxy)
 }
@@ -498,15 +568,23 @@ func FormatConfigJSON(raw []byte) ([]byte, error) {
 
 func normalizeConfigFieldAliases(fields map[string]json.RawMessage) {
 	aliases := map[string]string{
-		"allow-target": "allow_target",
-		"deny-target":  "deny_target",
-		"allow-host":   "allow_host",
-		"deny-host":    "deny_host",
-		"max-clients":  "max_clients",
-		"max-streams":  "max_streams",
-		"client-ca":    "client_ca",
-		"client-cert":  "client_cert",
-		"client-key":   "client_key",
+		"allow-target":        "allow_target",
+		"deny-target":         "deny_target",
+		"allow-host":          "allow_host",
+		"deny-host":           "deny_host",
+		"max-clients":         "max_clients",
+		"max-streams":         "max_streams",
+		"client-ca":           "client_ca",
+		"client-cert":         "client_cert",
+		"client-key":          "client_key",
+		"ech-domain":          "ech_domain",
+		"cipher-pref":         "cipher_pref",
+		"pacing-rate-mbps":    "pacing_rate_mbps",
+		"shaping-coalesce-ms": "shaping_coalesce_ms",
+		"transport-mode":      "transport",
+		"quic-port":           "quic_port",
+		"enable-datagram":     "enable_datagram",
+		"cover-traffic":       "cover_traffic",
 	}
 	for alias, canonical := range aliases {
 		if value, ok := fields[alias]; ok {
@@ -579,6 +657,38 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	if err != nil {
 		return err
 	}
+	echDomainVal, err := singleStringConfigAlias("ech_domain", "ech-domain", fc.ECHDomain, fc.ECHDomainFlag)
+	if err != nil {
+		return err
+	}
+	cipherPrefVal, err := singleStringConfigAlias("cipher_pref", "cipher-pref", fc.CipherPref, fc.CipherPrefFlag)
+	if err != nil {
+		return err
+	}
+	pacingRateVal, err := singleFloat64ConfigAlias("pacing_rate_mbps", "pacing-rate-mbps", fc.PacingRateMbps, fc.PacingRateMbpsFlag)
+	if err != nil {
+		return err
+	}
+	shapingCoalesceVal, err := singleIntConfigAlias("shaping_coalesce_ms", "shaping-coalesce-ms", fc.ShapingCoalesceMs, fc.ShapingCoalesceMsFlag)
+	if err != nil {
+		return err
+	}
+	transportVal, err := singleStringConfigAlias("transport", "transport_mode", fc.Transport, fc.TransportFlag)
+	if err != nil {
+		return err
+	}
+	quicPortVal, err := singleIntConfigAlias("quic_port", "quic-port", fc.QuicPort, fc.QuicPortFlag)
+	if err != nil {
+		return err
+	}
+	enableDatagramVal, err := singleBoolConfigAlias("enable_datagram", "enable-datagram", fc.EnableDatagram, fc.EnableDatagramFlag)
+	if err != nil {
+		return err
+	}
+	coverTrafficVal, err := singleBoolConfigAlias("cover_traffic", "cover-traffic", fc.CoverTraffic, fc.CoverTrafficFlag)
+	if err != nil {
+		return err
+	}
 	applyStringConfig(seen, "l", fc.Listen, &values.ListenAddr)
 	applyStringConfig(seen, "f", fc.Forward, &values.ForwardAddr)
 	applyStringConfig(seen, "ip", fc.IP, &values.IPAddr)
@@ -596,8 +706,18 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	applyStringConfig(seen, "allow-host", allowHost, &values.TargetAllowHosts)
 	applyStringConfig(seen, "deny-host", denyHost, &values.TargetDenyHosts)
 	applyStringConfig(seen, "dns", fc.DNS, &values.DNSServer)
-	applyStringConfig(seen, "ech", fc.ECH, &values.ECHDomain)
+	if fc.ECH != nil && !seen["ech"] {
+		values.EnableECH = *fc.ECH
+	}
+	applyStringConfig(seen, "ech-domain", echDomainVal, &values.ECHDomain)
 	applyStringConfig(seen, "ips", fc.IPS, &values.IPS)
+	applyStringConfig(seen, "cipher-pref", cipherPrefVal, &values.CipherPref)
+	if err := applyNonNegativeFloat64Config(seen, "pacing-rate-mbps", pacingRateVal, &values.PacingRateMbps); err != nil {
+		return err
+	}
+	if err := applyNonNegativeIntConfig(seen, "shaping-coalesce-ms", shapingCoalesceVal, &values.ShapingCoalesceMs); err != nil {
+		return err
+	}
 	if fc.Connections != nil && !seen["n"] {
 		values.ConnectionNum = *fc.Connections
 	}
@@ -612,6 +732,16 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	}
 	if fc.Fallback != nil && !seen["fallback"] {
 		values.Fallback = *fc.Fallback
+	}
+	applyStringConfig(seen, "transport", transportVal, &values.TransportMode)
+	if err := applyNonNegativeIntConfig(seen, "quic-port", quicPortVal, &values.QuicPort); err != nil {
+		return err
+	}
+	if enableDatagramVal != nil && !seen["enable-datagram"] {
+		values.EnableDatagram = *enableDatagramVal
+	}
+	if coverTrafficVal != nil && !seen["cover-traffic"] {
+		values.CoverTraffic = *coverTrafficVal
 	}
 	if fc.WebSocketFrontProxy != nil {
 		values.WebSocketFrontProxy = cloneWebSocketFrontProxyConfig(*fc.WebSocketFrontProxy)
@@ -675,6 +805,84 @@ func singleIntConfigAlias(primaryName, aliasName string, primary, alias *int) (*
 		return primary, nil
 	}
 	return alias, nil
+}
+
+func singleFloat64ConfigAlias(primaryName, aliasName string, primary, alias *float64) (*float64, error) {
+	if primary != nil && alias != nil {
+		return nil, fmt.Errorf("配置字段 %q 和 %q 不能同时设置", primaryName, aliasName)
+	}
+	if primary != nil {
+		return primary, nil
+	}
+	return alias, nil
+}
+
+func singleBoolConfigAlias(primaryName, aliasName string, primary, alias *bool) (*bool, error) {
+	if primary != nil && alias != nil {
+		return nil, fmt.Errorf("配置字段 %q 和 %q 不能同时设置", primaryName, aliasName)
+	}
+	if primary != nil {
+		return primary, nil
+	}
+	return alias, nil
+}
+
+func applyNonNegativeFloat64Config(seen map[string]bool, flagName string, value *float64, target *float64) error {
+	if value == nil || seen[flagName] {
+		return nil
+	}
+	if *value < 0 {
+		return fmt.Errorf("配置字段 %q 不能小于 0", flagName)
+	}
+	*target = *value
+	return nil
+}
+
+func parseCipherPreference(raw string) ([]byte, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("cipher 偏好不能为空")
+	}
+	parts := strings.Split(trimmed, ",")
+	if len(parts) > 8 {
+		return nil, fmt.Errorf("cipher 偏好列表长度超限 (最大支持 8 个，当前 %d 个)", len(parts))
+	}
+	supported := v3SupportedCiphers()
+	supportedMap := make(map[byte]bool, len(supported))
+	for _, id := range supported {
+		supportedMap[id] = true
+	}
+
+	result := make([]byte, 0, len(parts))
+	for _, part := range parts {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			return nil, fmt.Errorf("cipher ID 不能为空")
+		}
+		num, err := strconv.ParseUint(p, 10, 8)
+		if err != nil {
+			return nil, fmt.Errorf("无效的 cipher ID %q: %w", p, err)
+		}
+		id := byte(num)
+		if !supportedMap[id] {
+			return nil, fmt.Errorf("不支持的 cipher ID: %d", id)
+		}
+		result = append(result, id)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("cipher 偏好列表不能为空")
+	}
+	return result, nil
+}
+
+func clientCipherPreference() []byte {
+	if len(configuredCipherPref) > 0 {
+		return configuredCipherPref
+	}
+	if parsed, err := parseCipherPreference(cipherPrefStr); err == nil && len(parsed) > 0 {
+		return parsed
+	}
+	return defaultCipherPreference
 }
 
 func applyStringConfig(seen map[string]bool, flagName string, value *string, target *string) {
@@ -944,10 +1152,14 @@ type listenerStartupConfig struct {
 }
 
 type clientStartupConfig struct {
-	ForwardScheme string
-	Fallback      bool
-	AutoFallback  bool
-	UDPBlockPorts map[int]struct{}
+	ForwardScheme     string
+	Fallback          bool
+	AutoFallback      bool
+	UDPBlockPorts     map[int]struct{}
+	EnableECH         bool
+	CipherPref        []byte
+	PacingRateMbps    float64
+	ShapingCoalesceMs int
 }
 
 type startupConfig struct {
@@ -1023,7 +1235,7 @@ func validateServerStartupConfig(forward, allowCIDRs, denyCIDRs, allowHosts, den
 	return policy, config, nil
 }
 
-func validateClientStartupConfig(forward string, connections int, clientCert, clientKey string, insecureMode, fallbackMode bool, blockPortsRaw string) (clientStartupConfig, error) {
+func validateClientStartupConfig(forward string, connections int, clientCert, clientKey string, insecureMode, fallbackMode, enableECHMode bool, blockPortsRaw string) (clientStartupConfig, error) {
 	if forward == "" {
 		return clientStartupConfig{}, fmt.Errorf("客户端模式必须指定服务地址 (-f ws:// 或 -f wss://)")
 	}
@@ -1049,6 +1261,9 @@ func validateClientStartupConfig(forward string, connections int, clientCert, cl
 		return clientStartupConfig{}, fmt.Errorf("-block 参数无效: %w", err)
 	}
 	fallback := fallbackMode
+	if !enableECHMode {
+		fallback = true
+	}
 	autoFallback := false
 	if scheme == "wss" && insecureMode && !fallback {
 		fallback = true
@@ -1059,6 +1274,7 @@ func validateClientStartupConfig(forward string, connections int, clientCert, cl
 		Fallback:      fallback,
 		AutoFallback:  autoFallback,
 		UDPBlockPorts: ports,
+		EnableECH:     enableECHMode,
 	}, nil
 }
 
@@ -1072,6 +1288,21 @@ func validateStartupConfigValues(values runtimeValues) (*startupConfig, error) {
 	}
 	if err := validateGlobalConfigValues(values.Global, values.MaxClientSessions, values.MaxStreamsPerClient); err != nil {
 		return nil, fmt.Errorf("全局参数无效: %w", err)
+	}
+	if values.PacingRateMbps < 0 {
+		return nil, fmt.Errorf("-pacing-rate-mbps 不能小于 0")
+	}
+	if values.ShapingCoalesceMs < 0 {
+		return nil, fmt.Errorf("-shaping-coalesce-ms 不能小于 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(values.TransportMode)) {
+	case "", "auto", "quic", "tcp":
+	default:
+		return nil, fmt.Errorf("无效的 transport 模式 %q，仅支持 auto/quic/tcp", values.TransportMode)
+	}
+	parsedCipherPref, err := parseCipherPreference(values.CipherPref)
+	if err != nil {
+		return nil, fmt.Errorf("cipher 偏好无效: %w", err)
 	}
 	if values.MetricsAddr != "" {
 		if err := validateMetricsListenHostPort(values.MetricsAddr); err != nil {
@@ -1117,7 +1348,7 @@ func validateStartupConfigValues(values runtimeValues) (*startupConfig, error) {
 		startup.SOCKS5Config = socksConfig
 		return startup, nil
 	}
-	clientConfig, err := validateClientStartupConfig(values.ForwardAddr, values.ConnectionNum, values.ClientCertFile, values.ClientKeyFile, values.Insecure, values.Fallback, values.UDPBlockPortsStr)
+	clientConfig, err := validateClientStartupConfig(values.ForwardAddr, values.ConnectionNum, values.ClientCertFile, values.ClientKeyFile, values.Insecure, values.Fallback, values.EnableECH, values.UDPBlockPortsStr)
 	if err != nil {
 		return nil, err
 	}
@@ -1129,6 +1360,10 @@ func validateStartupConfigValues(values runtimeValues) (*startupConfig, error) {
 	if err := validateWebSocketFrontProxyConfig(values.WebSocketFrontProxy); err != nil {
 		return nil, fmt.Errorf("WebSocket 前置代理配置无效: %w", err)
 	}
+	clientConfig.CipherPref = parsedCipherPref
+	clientConfig.PacingRateMbps = values.PacingRateMbps
+	clientConfig.ShapingCoalesceMs = values.ShapingCoalesceMs
 	startup.Client = clientConfig
+	configuredCipherPref = parsedCipherPref
 	return startup, nil
 }

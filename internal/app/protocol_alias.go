@@ -2,6 +2,7 @@ package app
 
 import (
 	"io"
+	"time"
 
 	"x-tunnel/internal/wire"
 )
@@ -19,6 +20,7 @@ const (
 	protocolCapabilityUDPStatus      = 1 << 5
 	protocolCapabilityOpenStatusCode = 1 << 6
 	protocolCapabilityChannelStats   = 1 << 9
+	protocolCapabilityForwardSecrecy = wire.ProtocolCapabilityForwardSecrecy
 
 	tcpOpenStatusOK    = wire.TCPOpenStatusOK
 	tcpOpenStatusError = wire.TCPOpenStatusError
@@ -34,16 +36,26 @@ const (
 	maxProtocolFieldLen = wire.MaxProtocolFieldLen
 	maxV2FrameSize      = wire.MaxV2FrameSize
 
-	v2RejectAuthenticationFailed = wire.V2RejectAuthenticationFailed
-	v2RejectTimestampSkew        = wire.V2RejectTimestampSkew
-	v2RejectReplayDetected       = wire.V2RejectReplayDetected
-	v2RejectResourceLimit        = wire.V2RejectResourceLimit
-	v2RejectMalformedFrame       = wire.V2RejectMalformedFrame
+	v2RejectMissingRequiredCapability = wire.V2RejectMissingRequiredCapability
+	v2RejectAuthenticationFailed      = wire.V2RejectAuthenticationFailed
+	v2RejectTimestampSkew             = wire.V2RejectTimestampSkew
+	v2RejectReplayDetected            = wire.V2RejectReplayDetected
+	v2RejectResourceLimit             = wire.V2RejectResourceLimit
+	v2RejectMalformedFrame            = wire.V2RejectMalformedFrame
+
+	protocolV3Version              = wire.ProtocolV3Version
+	protocolCipherChaCha20Poly1305 = wire.ProtocolCipherChaCha20Poly1305
+	protocolCipherAES256GCM        = wire.ProtocolCipherAES256GCM
+	protocolCipherAES128GCM        = wire.ProtocolCipherAES128GCM
+	v3RejectUnsupportedCipher      = wire.V3RejectUnsupportedCipher
+	v3RecordTAI64N                 = wire.V3RecordTAI64N
 )
 
 type ChannelInit = wire.ChannelInit
 type ChannelAccept = wire.ChannelAccept
 type ChannelReject = wire.ChannelReject
+type V3SessionKeys = wire.V3SessionKeys
+type V3CipherStream = wire.V3CipherStream
 
 func isSupportedStreamKind(kind byte) bool { return wire.IsSupportedStreamKind(kind) }
 
@@ -71,6 +83,106 @@ func readChannelAcceptOrReject(r io.Reader, maxSize int) (ChannelAccept, Channel
 
 func writeChannelReject(w io.Writer, reject ChannelReject) error {
 	return wire.WriteChannelReject(w, reject)
+}
+
+func encodeChannelInitV3(init ChannelInit) ([]byte, error) {
+	return wire.EncodeChannelInitV3(init)
+}
+
+func writeChannelInitV3(w io.Writer, init ChannelInit) error {
+	return wire.WriteChannelInitV3(w, init)
+}
+
+func readChannelInitV3(r io.Reader, maxSize int) (ChannelInit, error) {
+	return wire.ReadChannelInitV3(r, maxSize)
+}
+
+func writeChannelAcceptV3(w io.Writer, accept ChannelAccept) error {
+	return wire.WriteChannelAcceptV3(w, accept)
+}
+
+func readChannelAcceptOrRejectV3(r io.Reader, maxSize int) (ChannelAccept, ChannelReject, error) {
+	return wire.ReadChannelAcceptOrRejectV3(r, maxSize)
+}
+
+func writeChannelRejectV3(w io.Writer, reject ChannelReject) error {
+	return wire.WriteChannelRejectV3(w, reject)
+}
+
+func negotiateCipherV3(pref []byte) (chosen byte, rejectCode byte, msg string) {
+	return wire.NegotiateCipherV3(pref)
+}
+
+func v3SupportedCiphers() []byte {
+	return wire.V3SupportedCiphers()
+}
+
+func v3CipherKeyLen(id byte) int {
+	return wire.V3CipherKeyLen(id)
+}
+
+func v3CipherName(id byte) string {
+	return wire.V3CipherName(id)
+}
+
+func newV3ClientEphemeralKey() (ephSk, ephPk []byte, err error) {
+	return wire.NewV3ClientEphemeralKey()
+}
+
+func computeV3SharedSecret(ephSk, peerPk []byte) ([]byte, error) {
+	return wire.ComputeV3SharedSecret(ephSk, peerPk)
+}
+
+func computeV3TranscriptHash(serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte, full bool) ([]byte, error) {
+	return wire.ComputeV3TranscriptHash(serverName, path, init, serverEphPK, serverNonce, negotiatedCipher, full)
+}
+
+func computeV3TranscriptHashInit(serverName, path string, init ChannelInit) ([]byte, error) {
+	return wire.ComputeV3TranscriptHashInit(serverName, path, init)
+}
+
+func computeV3TranscriptHashFull(serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte) ([]byte, error) {
+	return wire.ComputeV3TranscriptHashFull(serverName, path, init, serverEphPK, serverNonce, negotiatedCipher)
+}
+
+func computeV3AuthProof(token, serverName, path string, init ChannelInit) ([]byte, error) {
+	return wire.ComputeV3AuthProof(token, serverName, path, init)
+}
+
+func verifyV3AuthProof(token, serverName, path string, init ChannelInit) bool {
+	return wire.VerifyV3AuthProof(token, serverName, path, init)
+}
+
+func computeV3ServerProof(token, serverName, path string, init ChannelInit, serverEphPK, serverNonce []byte, negotiatedCipher byte) ([]byte, error) {
+	return wire.ComputeV3ServerProof(token, serverName, path, init, serverEphPK, serverNonce, negotiatedCipher)
+}
+
+func verifyV3ServerProof(token, serverName, path string, init ChannelInit, accept ChannelAccept) bool {
+	return wire.VerifyV3ServerProof(token, serverName, path, init, accept)
+}
+
+func deriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3SessionKeys, error) {
+	return wire.DeriveV3SessionSeed(token, transcriptHashFull, shared)
+}
+
+func deriveV3SessionKeys(token string, transcriptHash []byte) (V3SessionKeys, error) {
+	return wire.DeriveV3SessionKeys(token, transcriptHash)
+}
+
+func newV3CipherStream(inner io.ReadWriteCloser, keys V3SessionKeys, cipherID byte, streamID uint32, clientSide bool) (*V3CipherStream, error) {
+	return wire.NewV3CipherStream(inner, keys, cipherID, streamID, clientSide)
+}
+
+func encodeTAI64N(t time.Time) []byte {
+	return wire.EncodeTAI64N(t)
+}
+
+func decodeTAI64N(b []byte) (time.Time, error) {
+	return wire.DecodeTAI64N(b)
+}
+
+func compareTAI64N(a, b []byte) int {
+	return wire.CompareTAI64N(a, b)
 }
 
 func computeV2AuthProof(token, serverName, path string, init ChannelInit) ([]byte, error) {

@@ -44,6 +44,7 @@ type Engine struct {
 
 	listeners []*runtimeListener
 	control   *controlServer
+	echPool   *ECHPool
 	logs      *LogRing
 	logUndo   func()
 	fatalErr  error
@@ -117,6 +118,12 @@ func (e *Engine) abortStart(ctx context.Context) {
 	if cancel != nil {
 		cancel()
 	}
+	e.mu.Lock()
+	pool := e.echPool
+	e.mu.Unlock()
+	if pool != nil {
+		pool.WaitDone(ctx)
+	}
 	for _, listener := range listeners {
 		_ = listener.Close()
 	}
@@ -153,7 +160,7 @@ func (e *Engine) startRuntime() error {
 		if e.config.values.Token == "" {
 			log.Printf("[服务端] 警告: 未配置 token，v2 ChannelInit 不会校验 HMAC proof")
 		}
-		log.Printf("[服务端] protocol=v2-only")
+		log.Printf("[服务端] protocol=v3")
 		targetPolicy = startup.TargetPolicy
 		socks5Config = startup.SOCKS5Config
 		if socks5Config != nil {
@@ -175,7 +182,7 @@ func (e *Engine) startRuntime() error {
 	if e.config.values.Token == "" {
 		log.Printf("[客户端] 警告: 未配置 token，将发送空 token 的 v2 ChannelInit proof")
 	}
-	log.Printf("[客户端] protocol=v2-only")
+	log.Printf("[客户端] protocol=v3")
 	ipStrategy = startup.IPStrategy
 	if e.config.values.IPS != "" {
 		log.Printf("[客户端] IP 访问策略: %s (code: %d)", e.config.values.IPS, ipStrategy)
@@ -220,6 +227,9 @@ func (e *Engine) startRuntime() error {
 	log.Printf("[客户端] 客户端ID: %s", clientID)
 
 	echPool = NewECHPool(e.config.values.ForwardAddr, e.config.values.ConnectionNum, startup.TargetIPs, clientID)
+	e.mu.Lock()
+	e.echPool = echPool
+	e.mu.Unlock()
 	echPool.Start(e.ctx)
 
 	for _, listenerRule := range startup.Listeners {
@@ -331,6 +341,12 @@ func (e *Engine) Close(ctx context.Context) error {
 
 	if cancel != nil {
 		cancel()
+	}
+	e.mu.Lock()
+	pool := e.echPool
+	e.mu.Unlock()
+	if pool != nil {
+		pool.WaitDone(ctx)
 	}
 	for _, listener := range listeners {
 		_ = listener.Close()
