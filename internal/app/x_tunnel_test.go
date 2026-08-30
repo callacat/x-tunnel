@@ -6213,6 +6213,7 @@ func TestNegotiateClientProtocolSuccess(t *testing.T) {
 	token = "v3-test-token"
 	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
 	serverDone := make(chan error, 1)
+	serverKeysCh := make(chan V3SessionKeys, 1)
 	go func() {
 		stream, err := serverSession.AcceptStream()
 		if err != nil {
@@ -6238,15 +6239,35 @@ func TestNegotiateClientProtocolSuccess(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		_ = serverSk
-		serverProof, err := computeV3ServerProof(token, "example.com", "/tunnel", init, serverPk, protocolCipherChaCha20Poly1305)
+		serverNonce := bytes.Repeat([]byte{0x22}, 32)
+		serverProof, err := computeV3ServerProof(token, "example.com", "/tunnel", init, serverPk, serverNonce, protocolCipherChaCha20Poly1305)
 		if err != nil {
 			serverDone <- err
 			return
 		}
+
+		// Independently derive the server-side session keys to later verify
+		// both handshake sides agree on identical keys.
+		shared, err := computeV3SharedSecret(serverSk, init.ClientEphPK)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		thFull, err := computeV3TranscriptHashFull("example.com", "/tunnel", init, serverPk, serverNonce, protocolCipherChaCha20Poly1305)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverKeys, err := deriveV3SessionSeed(token, thFull, shared)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverKeysCh <- serverKeys
+
 		serverDone <- writeChannelAcceptV3(stream, ChannelAccept{
 			Capabilities: currentProtocolCapabilitiesV2(),
-			ServerNonce:  bytes.Repeat([]byte{0x22}, 32),
+			ServerNonce:  serverNonce,
 			ServerTime:   init.Timestamp,
 			MaxFrameSize: maxV2FrameSize,
 			Cipher:       protocolCipherChaCha20Poly1305,
@@ -6259,6 +6280,12 @@ func TestNegotiateClientProtocolSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("negotiateClientProtocol returned error: %v", err)
 	}
+	serverKeys := <-serverKeysCh
+	if !bytes.Equal(keys.Seed, serverKeys.Seed) ||
+		!bytes.Equal(keys.C2SNoncePrefix, serverKeys.C2SNoncePrefix) ||
+		!bytes.Equal(keys.S2CNoncePrefix, serverKeys.S2CNoncePrefix) {
+		t.Fatal("client and server derived different v3 session keys")
+	}
 	if caps != currentProtocolCapabilitiesV2() {
 		t.Fatalf("negotiateClientProtocol caps = 0x%x, want 0x%x", caps, currentProtocolCapabilitiesV2())
 	}
@@ -6267,6 +6294,65 @@ func TestNegotiateClientProtocolSuccess(t *testing.T) {
 	}
 	if len(keys.Seed) != 32 {
 		t.Fatalf("negotiateClientProtocol seed len = %d, want 32", len(keys.Seed))
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server ChannelInit handler returned error: %v", err)
+	}
+}
+
+// TestNegotiateClientProtocolRejectsTamperedServerNonce: the server computes
+// its proof over nonce A but sends nonce B; the client must reject because
+// ServerNonce is bound into the v3 server proof.
+func TestNegotiateClientProtocolRejectsTamperedServerNonce(t *testing.T) {
+	oldToken := token
+	t.Cleanup(func() { token = oldToken })
+	token = "v3-test-token"
+	serverSession, clientSession := newProtocolNegotiationSmuxPair(t)
+	serverDone := make(chan error, 1)
+	go func() {
+		stream, err := serverSession.AcceptStream()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer stream.Close()
+		if err := stream.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			serverDone <- err
+			return
+		}
+		init, err := readChannelInitV3(stream, maxV2FrameSize)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverSk, serverPk, err := newV3ClientEphemeralKey()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		_ = serverSk
+		nonceA := bytes.Repeat([]byte{0x2a}, 32)
+		serverProof, err := computeV3ServerProof(token, "example.com", "/tunnel", init, serverPk, nonceA, protocolCipherChaCha20Poly1305)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		tamperedNonce := bytes.Repeat([]byte{0x2a}, 32)
+		tamperedNonce[0] ^= 0x01
+		serverDone <- writeChannelAcceptV3(stream, ChannelAccept{
+			Capabilities: currentProtocolCapabilitiesV2(),
+			ServerNonce:  tamperedNonce,
+			ServerTime:   init.Timestamp,
+			MaxFrameSize: maxV2FrameSize,
+			Cipher:       protocolCipherChaCha20Poly1305,
+			ServerEphPK:  serverPk,
+			ServerProof:  serverProof,
+		})
+	}()
+
+	_, _, _, err := negotiateClientProtocol(clientSession, time.Second, uuid.NewString(), 1, "ws://example.com/tunnel")
+	if err == nil || !strings.Contains(err.Error(), "服务端证明校验失败") {
+		t.Fatalf("negotiateClientProtocol must reject tampered ServerNonce, got err=%v", err)
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server ChannelInit handler returned error: %v", err)

@@ -496,7 +496,7 @@ func negotiateClientProtocol(sessAny any, timeout time.Duration, clientID string
 		return 0, V3SessionKeys{}, 0, fmt.Errorf("服务端证明校验失败")
 	}
 
-	thFull, err := computeV3TranscriptHashFull(serverName, serverPath, init, accept.ServerEphPK, accept.Cipher)
+	thFull, err := computeV3TranscriptHashFull(serverName, serverPath, init, accept.ServerEphPK, accept.ServerNonce, accept.Cipher)
 	if err != nil {
 		return 0, V3SessionKeys{}, 0, fmt.Errorf("计算 transcript hash 失败: %w", err)
 	}

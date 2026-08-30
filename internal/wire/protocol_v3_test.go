@@ -40,6 +40,10 @@ func fixedTestServerPk() []byte {
 	return pk
 }
 
+func fixedTestServerNonce() []byte {
+	return bytes.Repeat([]byte{0x5c}, 32)
+}
+
 func fixedTestSharedSecret() []byte {
 	shared, err := curve25519.X25519(fixedTestClientSk, fixedTestServerPk())
 	if err != nil {
@@ -260,21 +264,21 @@ func TestV3GoldenVectors(t *testing.T) {
 
 	// 4. Full transcript hash with ServerEphPK and negotiated cipher
 	chosenCipher := ProtocolCipherChaCha20Poly1305
-	thFull, err := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, chosenCipher)
+	thFull, err := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), chosenCipher)
 	if err != nil {
 		t.Fatalf("ComputeV3TranscriptHashFull error: %v", err)
 	}
-	const wantTranscriptHashFullHex = "bc87b5a665d9e1d78f57970e12ad16ab5758b079f59da6ed87ae02473bb386f3"
+	const wantTranscriptHashFullHex = "c929f8af07d6667ce3b36f47b9d62c72e2da414348bd94a4e942608c82d500a2"
 	if hex.EncodeToString(thFull) != wantTranscriptHashFullHex {
 		t.Fatalf("TranscriptHashFull golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(thFull), wantTranscriptHashFullHex)
 	}
 
 	// 5. Server proof
-	serverProof, err := ComputeV3ServerProof(token, serverName, path, init, serverPk, chosenCipher)
+	serverProof, err := ComputeV3ServerProof(token, serverName, path, init, serverPk, fixedTestServerNonce(), chosenCipher)
 	if err != nil {
 		t.Fatalf("ComputeV3ServerProof error: %v", err)
 	}
-	const wantServerProofHex = "063ba411332a0ceb692f5bcbcb00da5754f00ee818200e7d9a02c2e2e4c3505e"
+	const wantServerProofHex = "77a074729307b1c1ba1dcf32d9279edba43f48f0220d5aeeac02bf5b6824fe7b"
 	if hex.EncodeToString(serverProof) != wantServerProofHex {
 		t.Fatalf("ServerProof golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(serverProof), wantServerProofHex)
 	}
@@ -285,17 +289,17 @@ func TestV3GoldenVectors(t *testing.T) {
 		t.Fatalf("DeriveV3SessionSeed error: %v", err)
 	}
 
-	const wantSeedHex = "042a2cefda7ebd3741817d139ddc1c354d5ac637a0b0fe84d6a0f3036d2a8784"
+	const wantSeedHex = "617382685a67b66536df96fb09acc66f29737f6b5393850b8d2def0b346ef034"
 	if hex.EncodeToString(keys.Seed) != wantSeedHex {
 		t.Fatalf("Seed golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(keys.Seed), wantSeedHex)
 	}
 
-	const wantC2SNoncePrefixHex = "f8cbcce3"
+	const wantC2SNoncePrefixHex = "e4e9191b"
 	if hex.EncodeToString(keys.C2SNoncePrefix) != wantC2SNoncePrefixHex {
 		t.Fatalf("C2SNoncePrefix golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(keys.C2SNoncePrefix), wantC2SNoncePrefixHex)
 	}
 
-	const wantS2CNoncePrefixHex = "4a51c1bc"
+	const wantS2CNoncePrefixHex = "17b91c90"
 	if hex.EncodeToString(keys.S2CNoncePrefix) != wantS2CNoncePrefixHex {
 		t.Fatalf("S2CNoncePrefix golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(keys.S2CNoncePrefix), wantS2CNoncePrefixHex)
 	}
@@ -305,7 +309,7 @@ func TestV3GoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamKey ChaCha error: %v", err)
 	}
-	const wantC2SChaChaKeyHex = "19776fc388ee16e39620f247c52e4f7a01271278227a2ab0ceb40da5d46438e7"
+	const wantC2SChaChaKeyHex = "1dce577ba2ab5e5d02cbcfd7a716253e30f7ed1014c9d8647e5ac29770f81f7e"
 	if hex.EncodeToString(c2sChaChaKey) != wantC2SChaChaKeyHex {
 		t.Fatalf("C2SChaChaKey golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(c2sChaChaKey), wantC2SChaChaKeyHex)
 	}
@@ -314,7 +318,7 @@ func TestV3GoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamKey AES256 error: %v", err)
 	}
-	const wantS2CAES256KeyHex = "b203e15e59785e0e32fa5b9a9fa53fa37c1296956a776e5381c842f3f519ed14"
+	const wantS2CAES256KeyHex = "10e4d16adf4e72aebfe311fd766a8a413ae70ded3c606d57bc03a76d9fa3e119"
 	if hex.EncodeToString(s2cAES256Key) != wantS2CAES256KeyHex {
 		t.Fatalf("S2CAES256Key golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(s2cAES256Key), wantS2CAES256KeyHex)
 	}
@@ -323,7 +327,7 @@ func TestV3GoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamKey AES128 error: %v", err)
 	}
-	const wantC2SAES128KeyHex = "368b3507bb08cc3114a13cd84a28de2a"
+	const wantC2SAES128KeyHex = "a61725a8e906cf0c8a476a520b02b04c"
 	if hex.EncodeToString(c2sAES128Key) != wantC2SAES128KeyHex {
 		t.Fatalf("C2SAES128Key golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(c2sAES128Key), wantC2SAES128KeyHex)
 	}
@@ -348,7 +352,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
 		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
 
-		const wantChaChaRecordHex = "000000000000000100160000a73e1833ee2d7d4904e104f4aedcc3ca07c1cd73a5724b25b2bf044ce0eb40cdc330bb38f6fc"
+		const wantChaChaRecordHex = "000000000000000100160000e2208133b48184a8061e211d6d924fa733892060f2290c1cb40bd5c9f8a81d7802916e833933"
 		if hex.EncodeToString(rec) != wantChaChaRecordHex {
 			t.Fatalf("ChaCha record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantChaChaRecordHex)
 		}
@@ -377,7 +381,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
 		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
 
-		const wantAES256RecordHex = "0000000000000001001600003b76b4b508d29c08f23318f5a165920606fb281c772de3eafa3855fe878ab8510bc0c8c6f8dd"
+		const wantAES256RecordHex = "000000000000000100160000cb6fda8fa5c511e1aeb90d1676f9a57ed5f74ba01d13a769a58bdf4945d0e4908a698613e53f"
 		if hex.EncodeToString(rec) != wantAES256RecordHex {
 			t.Fatalf("AES256 record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantAES256RecordHex)
 		}
@@ -406,7 +410,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
 		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
 
-		const wantAES128RecordHex = "00000000000000010016000026f45e9fb0ed83cb34384bf77195b1d4d91490a2b6f6c36ac65dd10947a48853e3237d8e1942"
+		const wantAES128RecordHex = "0000000000000001001600004ed7301a11e0e25d632fb456d9417537d89bfadeda44dcfb728c23a606732ed0afbc1769c084"
 		if hex.EncodeToString(rec) != wantAES128RecordHex {
 			t.Fatalf("AES128 record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantAES128RecordHex)
 		}
@@ -434,7 +438,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], uint16(len(pad))) // pad_len = 5
 		rec = aead.Seal(rec, nonceArr[:], payload, ad[:])
 
-		const wantChaChaPaddedRecordHex = "000000000000000100160005a73e1833ee2d7d4904e104f4aedcc3ca07c1cd73a572776f79e1ce37910bcfc349126cc841e0c998a15919"
+		const wantChaChaPaddedRecordHex = "000000000000000100160005e2208133b48184a8061e211d6d924fa733892060f22935ccf4adfde4b906c457d6dc4a10752da182e7819f"
 		if hex.EncodeToString(rec) != wantChaChaPaddedRecordHex {
 			t.Fatalf("ChaCha padded record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantChaChaPaddedRecordHex)
 		}
@@ -545,14 +549,14 @@ func TestV3HandshakeRoundTripAndAntiDowngrade(t *testing.T) {
 
 	// ChannelAccept round trip & server_proof verification
 	serverPk := fixedTestServerPk()
-	serverProof, err := ComputeV3ServerProof(token, serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	serverProof, err := ComputeV3ServerProof(token, serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	if err != nil {
 		t.Fatalf("ComputeV3ServerProof failed: %v", err)
 	}
 
 	accept := ChannelAccept{
 		Capabilities: 0x0000000000001bf7,
-		ServerNonce:  bytes.Repeat([]byte{0x5a}, 32),
+		ServerNonce:  fixedTestServerNonce(),
 		ServerTime:   1_700_000_005,
 		MaxFrameSize: 16384,
 		MaxStreams:   100,
@@ -610,6 +614,14 @@ func TestV3HandshakeRoundTripAndAntiDowngrade(t *testing.T) {
 		t.Fatal("VerifyV3ServerProof accepted tampered cipher in accept")
 	}
 
+	// Tamper ServerNonce: nonce must be covered by the server proof
+	tamperedAccept = accept
+	tamperedAccept.ServerNonce = append([]byte(nil), accept.ServerNonce...)
+	tamperedAccept.ServerNonce[0] ^= 0x01
+	if VerifyV3ServerProof(token, serverName, path, init, tamperedAccept) {
+		t.Fatal("VerifyV3ServerProof accepted tampered server nonce")
+	}
+
 	// ChannelReject round trip
 	rejectOut := ChannelReject{
 		Code:    V3RejectUnsupportedCipher,
@@ -638,7 +650,7 @@ func TestV3ForwardSecrecyProperties(t *testing.T) {
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
 
-	thFull, err := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, err := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	if err != nil {
 		t.Fatalf("ComputeV3TranscriptHashFull error: %v", err)
 	}
@@ -765,7 +777,7 @@ func TestV3CipherStreamBitFlipAndIntegrity(t *testing.T) {
 
 	for _, cipherID := range []byte{ProtocolCipherChaCha20Poly1305, ProtocolCipherAES256GCM, ProtocolCipherAES128GCM} {
 		t.Run(V3CipherName(cipherID), func(t *testing.T) {
-			thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, cipherID)
+			thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), cipherID)
 			keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
 			// Subtest A: unpadded record (PadRecords = false)
@@ -930,7 +942,7 @@ func TestV3CipherStreamReplayAndOutOfOrder(t *testing.T) {
 	init := fixedChannelInitV3()
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
-	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
 	// Generate 10 records from client
@@ -1031,7 +1043,7 @@ func TestV3CipherStreamRekey(t *testing.T) {
 	init := fixedChannelInitV3()
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
-	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
 	var pipeBuf bytes.Buffer
@@ -1096,7 +1108,7 @@ func TestV3Deadlines(t *testing.T) {
 	init := fixedChannelInitV3()
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
-	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
 	// Case 1: inner implements deadlines (net.Pipe)
@@ -1144,7 +1156,7 @@ func TestV3CipherStreamPayloadLimit(t *testing.T) {
 	init := fixedChannelInitV3()
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
-	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
 	// Case 1: plain_len + pad_len > 1400 -> Read rejects
@@ -1207,7 +1219,7 @@ func TestV3CipherStreamPaddingSamplingStats(t *testing.T) {
 	init := fixedChannelInitV3()
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
-	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
 	var pipeBuf bytes.Buffer
@@ -1287,11 +1299,11 @@ func TestV3TranscriptPaddingIndependent(t *testing.T) {
 	}
 
 	// Transcript Hash Full
-	thFull1, err := ComputeV3TranscriptHashFull(serverName, path, initWithoutPad, serverPk, chosenCipher)
+	thFull1, err := ComputeV3TranscriptHashFull(serverName, path, initWithoutPad, serverPk, fixedTestServerNonce(), chosenCipher)
 	if err != nil {
 		t.Fatalf("ComputeV3TranscriptHashFull 1 error: %v", err)
 	}
-	thFull2, err := ComputeV3TranscriptHashFull(serverName, path, initWithPad, serverPk, chosenCipher)
+	thFull2, err := ComputeV3TranscriptHashFull(serverName, path, initWithPad, serverPk, fixedTestServerNonce(), chosenCipher)
 	if err != nil {
 		t.Fatalf("ComputeV3TranscriptHashFull 2 error: %v", err)
 	}
@@ -1313,11 +1325,11 @@ func TestV3TranscriptPaddingIndependent(t *testing.T) {
 	}
 
 	// ServerProof
-	sProof1, err := ComputeV3ServerProof(token, serverName, path, initWithoutPad, serverPk, chosenCipher)
+	sProof1, err := ComputeV3ServerProof(token, serverName, path, initWithoutPad, serverPk, fixedTestServerNonce(), chosenCipher)
 	if err != nil {
 		t.Fatalf("ComputeV3ServerProof 1 error: %v", err)
 	}
-	sProof2, err := ComputeV3ServerProof(token, serverName, path, initWithPad, serverPk, chosenCipher)
+	sProof2, err := ComputeV3ServerProof(token, serverName, path, initWithPad, serverPk, fixedTestServerNonce(), chosenCipher)
 	if err != nil {
 		t.Fatalf("ComputeV3ServerProof 2 error: %v", err)
 	}
@@ -1334,7 +1346,7 @@ func TestV3CipherStreamCoalesce(t *testing.T) {
 	init := fixedChannelInitV3()
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
-	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, _ := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	keys, _ := DeriveV3SessionSeed(token, thFull, shared)
 
 	// Part A: CoalesceDelay = 20ms, write 3x 100B, flushed after delay

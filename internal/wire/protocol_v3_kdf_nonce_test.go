@@ -20,7 +20,7 @@ func TestDeriveV3SessionSeedUsesSharedAsIKM(t *testing.T) {
 	serverPk := fixedTestServerPk()
 	shared := fixedTestSharedSecret()
 
-	thFull, err := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	thFull, err := ComputeV3TranscriptHashFull(serverName, path, init, serverPk, fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	if err != nil {
 		t.Fatalf("ComputeV3TranscriptHashFull error: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestDeriveV3SessionKeysZeroSharedSecretFails(t *testing.T) {
 func TestDeriveV3SessionSeedRejectsZeroShared(t *testing.T) {
 	token := "secret-token"
 	init := fixedChannelInitV3()
-	thFull, err := ComputeV3TranscriptHashFull("edge.example.com", "/tunnel", init, fixedTestServerPk(), ProtocolCipherChaCha20Poly1305)
+	thFull, err := ComputeV3TranscriptHashFull("edge.example.com", "/tunnel", init, fixedTestServerPk(), fixedTestServerNonce(), ProtocolCipherChaCha20Poly1305)
 	if err != nil {
 		t.Fatalf("ComputeV3TranscriptHashFull error: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestV3ServerProofCoversServerNonce(t *testing.T) {
 	init := fixedChannelInitV3()
 	serverPk := fixedTestServerPk()
 
-	proof, err := ComputeV3ServerProof(token, serverName, path, init, serverPk, ProtocolCipherChaCha20Poly1305)
+	proof, err := ComputeV3ServerProof(token, serverName, path, init, serverPk, bytes.Repeat([]byte{0x5a}, 32), ProtocolCipherChaCha20Poly1305)
 	if err != nil {
 		t.Fatalf("ComputeV3ServerProof error: %v", err)
 	}
