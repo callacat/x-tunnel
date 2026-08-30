@@ -33,6 +33,29 @@ var defaultCipherPreference = []byte{
 	protocolCipherAES128GCM,
 }
 
+// clientTAI64NState guards the process-wide monotonically increasing TAI64N
+// timestamp source used by client handshakes. Parallel channels must never
+// emit duplicate or out-of-order timestamps.
+var clientTAI64NState struct {
+	sync.Mutex
+	lastNano int64
+}
+
+// nextClientTAI64N returns the next strictly monotonically increasing TAI64N
+// timestamp for client handshakes: result = max(last+1ns, now). Safe for
+// concurrent use.
+func nextClientTAI64N() []byte {
+	now := time.Now().UnixNano()
+	clientTAI64NState.Lock()
+	if now <= clientTAI64NState.lastNano {
+		now = clientTAI64NState.lastNano + 1
+	}
+	clientTAI64NState.lastNano = now
+	clientTAI64NState.Unlock()
+	return encodeTAI64N(time.Unix(0, now))
+}
+
+
 type ECHPool struct {
 	wsServerAddr  string
 	connectionNum int
@@ -424,16 +447,15 @@ func negotiateClientProtocol(sessAny any, timeout time.Duration, clientID string
 		}
 	}()
 
-	now := time.Now()
 	init := ChannelInit{
 		SessionID:    sessionID,
 		ChannelID:    channelID,
 		ClientNonce:  nonce,
-		Timestamp:    now.Unix(),
+		Timestamp:    time.Now().Unix(),
 		Capabilities: currentProtocolCapabilitiesV2() | protocolCapabilityForwardSecrecy,
 		CipherPref:   clientCipherPreference(),
 		ClientEphPK:  clientPk,
-		TAI64N:       encodeTAI64N(now),
+		TAI64N:       nextClientTAI64N(),
 	}
 	proof, err := computeV3AuthProof(token, serverName, serverPath, init)
 	if err != nil {
