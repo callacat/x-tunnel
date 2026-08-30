@@ -940,6 +940,11 @@ func handlePreAuthTransportSession(sess transport.TransportSession, closer io.Cl
 	atomic.AddUint64(&serverProtocolOKSeq, 1)
 	log.Printf("[服务端] v3 客户端通道 %d 连接, 会话ID: %s, IP: %s caps=0x%x cipher=%s transport=%s", ch.id, shortID(sessionID), clientIP, caps, v3CipherName(chosenCipher), sess.Type())
 	_ = stream.SetDeadline(time.Time{})
+	// 清除预认证阶段设置在底层 WS 连接上的整体 deadline，否则 PreAuthTimeout 后整个会话会被掐断（QUIC 会话无此 deadline）。
+	if ws, ok := closer.(*websocket.Conn); ok {
+		_ = ws.SetReadDeadline(time.Time{})
+		_ = ws.SetWriteDeadline(time.Time{})
+	}
 
 	if sess.Type() == transport.TransportTypeQUIC {
 		go handleQuicDatagrams(ch, sess)
