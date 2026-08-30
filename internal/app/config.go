@@ -160,6 +160,10 @@ var (
 	rulesPath    string
 	geoDir       string
 	routeEnabled bool
+	// round47：对裸 IP:443 的 proxy 连接嗅探 TLS ClientHello 的 SNI 改写域名目标
+	// （DoT/DoH 加密 DNS 绕过 UDP:53 嗅探导致 IP→域名映射全空的兜底）。默认开，
+	// -sni=false 关闭。
+	sniSniff bool
 
 	echListMu sync.RWMutex
 	echList   []byte
@@ -257,6 +261,7 @@ func init() {
 	flag.StringVar(&rulesPath, "rules-path", "", "可选分流规则文件路径（route-enabled 时必填或自动写默认模板）")
 	flag.StringVar(&geoDir, "geo-dir", "", "可选 GEO 数据库目录（geosite.dat / geoip-lite.dat）")
 	flag.BoolVar(&routeEnabled, "route-enabled", false, "是否启用分流引擎（GEO/域名规则）；服务端默认关闭")
+	flag.BoolVar(&sniSniff, "sni", true, "对裸 IP:443 的 proxy 连接嗅探 TLS SNI 改写域名目标（round47：DoT/DoH 加密 DNS 绕过 UDP:53 嗅探导致 IP→域名映射全空的兜底；默认开，-sni=false 关闭）")
 	flag.DurationVar(&cfg.DialTimeout, "dial-timeout", cfg.DialTimeout, "TCP/DNS 目标拨号超时时间")
 	flag.DurationVar(&cfg.WSHandshakeTimeout, "ws-handshake-timeout", cfg.WSHandshakeTimeout, "WebSocket 握手超时时间")
 	flag.DurationVar(&cfg.ReconnectDelay, "reconnect-delay", cfg.ReconnectDelay, "客户端重连初始退避时间")
@@ -327,6 +332,7 @@ type FileConfig struct {
 	RulesPath           *string                    `json:"rules_path"`
 	GeoDir              *string                    `json:"geo_dir"`
 	RouteEnabled        *bool                      `json:"route_enabled"`
+	SNI                 *bool                      `json:"sni"`
 }
 
 func visitedFlags() map[string]bool {
@@ -369,6 +375,7 @@ type runtimeValues struct {
 	RulesPath           string
 	GeoDir              string
 	RouteEnabled        bool
+	SNISniff            bool
 }
 
 type RuntimeConfig struct {
@@ -408,6 +415,7 @@ func currentRuntimeValues() runtimeValues {
 		RulesPath:           rulesPath,
 		GeoDir:              geoDir,
 		RouteEnabled:        routeEnabled,
+		SNISniff:            sniSniff,
 	}
 }
 
@@ -419,6 +427,7 @@ func defaultRuntimeValues() runtimeValues {
 		DNSServer:        "https://doh.pub/dns-query",
 		ECHDomain:        "cloudflare-ech.com",
 		Global:           defaultGlobalConfig(),
+		SNISniff:         true,
 	}
 }
 
@@ -452,6 +461,7 @@ func (values runtimeValues) applyGlobals() {
 	rulesPath = values.RulesPath
 	geoDir = values.GeoDir
 	routeEnabled = values.RouteEnabled
+	sniSniff = values.SNISniff
 }
 
 func newRuntimeConfig(values runtimeValues, startup *startupConfig) RuntimeConfig {
@@ -624,6 +634,9 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	applyStringConfig(seen, "geo-dir", fc.GeoDir, &values.GeoDir)
 	if fc.RouteEnabled != nil && !seen["route-enabled"] {
 		values.RouteEnabled = *fc.RouteEnabled
+	}
+	if fc.SNI != nil && !seen["sni"] {
+		values.SNISniff = *fc.SNI
 	}
 	if fc.Connections != nil && !seen["n"] {
 		values.ConnectionNum = *fc.Connections

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -337,6 +338,15 @@ func handleSOCKS5Connect(c net.Conn, target string) {
 		return
 	}
 
+	// round47：裸 IP:443 进隧道前的 SNI 嗅探改写（详见 handleSNIProxyConnect）。
+	// 分流判定用原 IP（geoip 语义保持不变）；改写为 SNI 域名后不二次判定，
+	// TODO(round47)：后续可再按 SNI 域名重判（SNI 可能命中与 IP geoip 不同的
+	// 规则），本轮不做。
+	if sniSniff && sniCandidate(target) {
+		handleSNIProxyConnect(c, target)
+		return
+	}
+
 	stream, _, decision, err := echPool.openTCPStream(target)
 	if err != nil {
 		log.Printf("[客户端] %s SOCKS5 打开失败 %s: %v", clientSourceAddr(c), target, err)
@@ -352,6 +362,90 @@ func handleSOCKS5Connect(c net.Conn, target string) {
 	logClientConnEvent(c, "SOCKS5", target, decision, true)
 	defer logClientConnEvent(c, "SOCKS5", target, decision, false)
 	proxyConnStream(c, stream)
+}
+
+// sniCandidate 判定 target 是否值得 SNI 嗅探：IP 字面量 + 443 端口。
+// 域名 target / 非 443（明文协议为主、无 SNI 可提）一律不值得。
+func sniCandidate(target string) bool {
+	host, portStr, err := net.SplitHostPort(target)
+	return err == nil && portStr == "443" && net.ParseIP(host) != nil
+}
+
+// handleSNIProxyConnect 处理「IP:443 + proxy 分支」连接的 SNI 嗅探改写。
+//
+// 顺序与标准 SOCKS5 服务器不同（sing-box 同款语义）：**先回 0x00 再嗅探**。
+// 原因：hev tun2socks（hev-socks5-core 标准握手 write_request → read_response
+// 之后才 splice TUN 数据；Android 侧 tun2socks.yml 未开 pipeline）必须先收到
+// 成功回复才把 TUN 缓存的 ClientHello 发上来——「先嗅探后回复」会让 Peek 永远
+// 空等到 1s deadline，改写永不生效且每个 IP:443 连接平白多 1 秒延迟。
+// 代价：edge 打开失败时已回过 0x00，无法再回 SOCKS5 错误码，只能关连接——
+// TLS 客户端把 reset 当连接失败自行重试/回退（Happy Eyeballs），与 sing-box
+// 行为一致；仅此路径（IP:443）如此，其余路径保持「先开后回」的精确错误码。
+func handleSNIProxyConnect(c net.Conn, target string) {
+	if err := writeSOCKS5Reply(c, 0x00); err != nil {
+		_ = c.Close()
+		return
+	}
+	target, conn := sniffSNITarget(c, target)
+	stream, _, decision, err := echPool.openTCPStream(target)
+	if err != nil {
+		log.Printf("[客户端] %s SOCKS5 打开失败 %s: %v", clientSourceAddr(conn), target, err)
+		_ = conn.Close()
+		return
+	}
+	logClientConnEvent(conn, "SOCKS5", target, decision, true)
+	defer logClientConnEvent(conn, "SOCKS5", target, decision, false)
+	proxyConnStream(conn, stream)
+}
+
+// sniffSNITarget 是 round47「裸 IP 进隧道」的首包嗅探：目标为 IP 字面量 :443
+// 时读首个 TLS ClientHello，提取 SNI 域名，命中则把 target 改写为 domain:443
+// 发服务器——服务端境外视角解析（无污染）且 MIhomo 域名分流（geosite/domain）
+// 恢复生效。
+//
+// 背景：Android 系统 DNS 走 DoT:853 加密后 sidecar 的 UDP:53 嗅探失效、
+// IP→域名映射全空，CONNECT 目标全是裸 IP（r46 真机实锤：服务端 MIhomo
+// 大量 context deadline exceeded）。
+//
+// 嗅探带 1s 读 deadline：客户端不发/慢发首包时不被 Peek 卡死，超时按「无 SNI」
+// 处理继续用原 IP target。已 Peek 进缓冲的字节（命中改写的完整首包、非 TLS 的
+// 部分/全部字节、截断记录）一律经 bufferedConn 回放给后续 proxyConnStream，
+// 保证首包不丢——所有提前返回路径都必须走 replay()，否则已读字节丢失。
+func sniffSNITarget(c net.Conn, target string) (string, net.Conn) {
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil || net.ParseIP(host) == nil || portStr != "443" {
+		return target, c
+	}
+	br := bufio.NewReader(c)
+	// 嗅探只等 1s：慢发/不发首包的连接不被卡住，超时按无 SNI 处理。
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	defer c.SetReadDeadline(time.Time{}) // 无论命中与否都恢复，正常双向转发
+	// replay 把 Peek 已吞进缓冲的字节包回连接；缓冲为空时原样返回。
+	replay := func() net.Conn {
+		if br.Buffered() > 0 {
+			return &bufferedConn{Conn: c, reader: br}
+		}
+		return c
+	}
+	head, err := br.Peek(5)
+	if err != nil || head[0] != 0x16 { // 非 TLS（如明文 HTTP 直连 443）
+		return target, replay()
+	}
+	// TLS record header：type(1) + version(2) + length(2) 大端；首包一般很小
+	// （ClientHello），recLen 上限 64KiB 防御异常大记录。
+	recLen := int(head[3])<<8 | int(head[4])
+	if recLen <= 0 || recLen >= 64*1024 {
+		return target, replay()
+	}
+	payload, err := br.Peek(5 + recLen)
+	if err != nil {
+		return target, replay()
+	}
+	if sni, ok := sniffSNI(payload); ok && sni != host {
+		log.Printf("[客户端] %s SNI 改写 %s -> %s", clientSourceAddr(c), target, net.JoinHostPort(sni, "443"))
+		return net.JoinHostPort(sni, "443"), &bufferedConn{Conn: c, reader: br}
+	}
+	return target, replay()
 }
 
 func handleSOCKS5UDP(c net.Conn, cfgp *ProxyConfig) {
