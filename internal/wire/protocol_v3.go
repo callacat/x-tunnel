@@ -740,8 +740,16 @@ func DeriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3Ses
 	if len(shared) != 32 {
 		return V3SessionKeys{}, fmt.Errorf("shared secret must be 32 bytes")
 	}
+	if isZeroBytesV3(shared) {
+		return V3SessionKeys{}, fmt.Errorf("shared secret must not be all zero")
+	}
 
-	prk := hkdf.Extract(sha256.New, []byte(token), []byte("xtunnel-v3-kdf"))
+	// The DH shared secret is secret input keying material and must enter via
+	// HKDF-Extract (ikm = shared || token), not mere Expand info.
+	ikm := make([]byte, 0, len(shared)+len(token))
+	ikm = append(ikm, shared...)
+	ikm = append(ikm, token...)
+	prk := hkdf.Extract(sha256.New, ikm, []byte("xtunnel-v3-kdf"))
 
 	seedReader := hkdf.Expand(sha256.New, prk, transcriptHashFull)
 	seed := make([]byte, 32)
@@ -749,11 +757,7 @@ func DeriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3Ses
 		return V3SessionKeys{}, err
 	}
 
-	sessionSeedInfo := make([]byte, len("xtunnel-v3 fs mix")+len(shared))
-	copy(sessionSeedInfo, "xtunnel-v3 fs mix")
-	copy(sessionSeedInfo[len("xtunnel-v3 fs mix"):], shared)
-
-	sessionSeedReader := hkdf.Expand(sha256.New, seed, sessionSeedInfo)
+	sessionSeedReader := hkdf.Expand(sha256.New, seed, []byte("xtunnel-v3 fs mix"))
 	sessionSeed := make([]byte, 32)
 	if _, err := io.ReadFull(sessionSeedReader, sessionSeed); err != nil {
 		return V3SessionKeys{}, err
@@ -778,9 +782,21 @@ func DeriveV3SessionSeed(token string, transcriptHashFull, shared []byte) (V3Ses
 	}, nil
 }
 
-// DeriveV3SessionKeys is a compatibility wrapper around DeriveV3SessionSeed with zero shared secret.
+// DeriveV3SessionKeys is a deprecated compatibility wrapper that historically
+// derived keys with an all-zero shared secret, silently disabling forward
+// secrecy. It now always fails; use DeriveV3SessionSeed with a real X25519
+// shared secret instead.
 func DeriveV3SessionKeys(token string, transcriptHash []byte) (V3SessionKeys, error) {
-	return DeriveV3SessionSeed(token, transcriptHash, make([]byte, 32))
+	return V3SessionKeys{}, fmt.Errorf("DeriveV3SessionKeys is disabled: a non-zero DH shared secret is required, use DeriveV3SessionSeed")
+}
+
+// isZeroBytesV3 reports whether b is entirely zero bytes.
+func isZeroBytesV3(b []byte) bool {
+	var or byte
+	for _, v := range b {
+		or |= v
+	}
+	return or == 0
 }
 
 // StreamKey derives a directional stream AEAD key for a specific cipher, stream ID, and generation.

@@ -285,17 +285,17 @@ func TestV3GoldenVectors(t *testing.T) {
 		t.Fatalf("DeriveV3SessionSeed error: %v", err)
 	}
 
-	const wantSeedHex = "3398ca29d0e2ed9dadc17ed9cbdeb2274c617abeee81600329a602ce8f90dbec"
+	const wantSeedHex = "042a2cefda7ebd3741817d139ddc1c354d5ac637a0b0fe84d6a0f3036d2a8784"
 	if hex.EncodeToString(keys.Seed) != wantSeedHex {
 		t.Fatalf("Seed golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(keys.Seed), wantSeedHex)
 	}
 
-	const wantC2SNoncePrefixHex = "c21441aa"
+	const wantC2SNoncePrefixHex = "f8cbcce3"
 	if hex.EncodeToString(keys.C2SNoncePrefix) != wantC2SNoncePrefixHex {
 		t.Fatalf("C2SNoncePrefix golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(keys.C2SNoncePrefix), wantC2SNoncePrefixHex)
 	}
 
-	const wantS2CNoncePrefixHex = "0813b710"
+	const wantS2CNoncePrefixHex = "4a51c1bc"
 	if hex.EncodeToString(keys.S2CNoncePrefix) != wantS2CNoncePrefixHex {
 		t.Fatalf("S2CNoncePrefix golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(keys.S2CNoncePrefix), wantS2CNoncePrefixHex)
 	}
@@ -305,7 +305,7 @@ func TestV3GoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamKey ChaCha error: %v", err)
 	}
-	const wantC2SChaChaKeyHex = "634c3cc971ac503b5dd995469b8e99fe7f14edea4d0b8955c28834cc1bbf9a87"
+	const wantC2SChaChaKeyHex = "19776fc388ee16e39620f247c52e4f7a01271278227a2ab0ceb40da5d46438e7"
 	if hex.EncodeToString(c2sChaChaKey) != wantC2SChaChaKeyHex {
 		t.Fatalf("C2SChaChaKey golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(c2sChaChaKey), wantC2SChaChaKeyHex)
 	}
@@ -314,7 +314,7 @@ func TestV3GoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamKey AES256 error: %v", err)
 	}
-	const wantS2CAES256KeyHex = "6684fbbce120ad0c3d609f3132cddf26d03fcbf2317da2e49f6a7dd808a827e9"
+	const wantS2CAES256KeyHex = "b203e15e59785e0e32fa5b9a9fa53fa37c1296956a776e5381c842f3f519ed14"
 	if hex.EncodeToString(s2cAES256Key) != wantS2CAES256KeyHex {
 		t.Fatalf("S2CAES256Key golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(s2cAES256Key), wantS2CAES256KeyHex)
 	}
@@ -323,7 +323,7 @@ func TestV3GoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamKey AES128 error: %v", err)
 	}
-	const wantC2SAES128KeyHex = "a5e3887216afd9aa70c25e167ab8e242"
+	const wantC2SAES128KeyHex = "368b3507bb08cc3114a13cd84a28de2a"
 	if hex.EncodeToString(c2sAES128Key) != wantC2SAES128KeyHex {
 		t.Fatalf("C2SAES128Key golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(c2sAES128Key), wantC2SAES128KeyHex)
 	}
@@ -348,7 +348,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
 		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
 
-		const wantChaChaRecordHex = "000000000000000100160000cbca217468d25c24a38079925f0e5b16731e359e8d8c55f7e08579b65d0e3f4c3425120036a4"
+		const wantChaChaRecordHex = "000000000000000100160000a73e1833ee2d7d4904e104f4aedcc3ca07c1cd73a5724b25b2bf044ce0eb40cdc330bb38f6fc"
 		if hex.EncodeToString(rec) != wantChaChaRecordHex {
 			t.Fatalf("ChaCha record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantChaChaRecordHex)
 		}
@@ -377,7 +377,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
 		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
 
-		const wantAES256RecordHex = "000000000000000100160000b0d764d22b5727d7e731a6342b22ac086fedf471e830b2d44508d960398b5a8fa2bc245cfd94"
+		const wantAES256RecordHex = "0000000000000001001600003b76b4b508d29c08f23318f5a165920606fb281c772de3eafa3855fe878ab8510bc0c8c6f8dd"
 		if hex.EncodeToString(rec) != wantAES256RecordHex {
 			t.Fatalf("AES256 record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantAES256RecordHex)
 		}
@@ -406,7 +406,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], 0) // pad_len = 0
 		rec = aead.Seal(rec, nonceArr[:], plain, ad[:])
 
-		const wantAES128RecordHex = "0000000000000001001600006fb0ab7cbde3278e6604798aff5f344d2f025871acee779650d7fc48e4e535b29c4fab377636"
+		const wantAES128RecordHex = "00000000000000010016000026f45e9fb0ed83cb34384bf77195b1d4d91490a2b6f6c36ac65dd10947a48853e3237d8e1942"
 		if hex.EncodeToString(rec) != wantAES128RecordHex {
 			t.Fatalf("AES128 record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantAES128RecordHex)
 		}
@@ -434,7 +434,7 @@ func TestV3GoldenVectors(t *testing.T) {
 		binary.BigEndian.PutUint16(rec[10:12], uint16(len(pad))) // pad_len = 5
 		rec = aead.Seal(rec, nonceArr[:], payload, ad[:])
 
-		const wantChaChaPaddedRecordHex = "000000000000000100160005cbca217468d25c24a38079925f0e5b16731e359e8d8c5832acb196a3211e8d665d3b61407978d6d599914c"
+		const wantChaChaPaddedRecordHex = "000000000000000100160005a73e1833ee2d7d4904e104f4aedcc3ca07c1cd73a572776f79e1ce37910bcfc349126cc841e0c998a15919"
 		if hex.EncodeToString(rec) != wantChaChaPaddedRecordHex {
 			t.Fatalf("ChaCha padded record golden mismatch:\ngot  %s\nwant %s", hex.EncodeToString(rec), wantChaChaPaddedRecordHex)
 		}

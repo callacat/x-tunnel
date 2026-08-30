@@ -5420,7 +5420,7 @@ func TestIsSupportedStreamKind(t *testing.T) {
 }
 
 var (
-	testV3Keys, _ = deriveV3SessionKeys("test-token", make([]byte, 32))
+	testV3Keys, _ = deriveV3SessionSeed("test-token", make([]byte, 32), bytes.Repeat([]byte{0x11}, 32))
 	testV3Cipher  = protocolCipherChaCha20Poly1305
 )
 
