@@ -1,0 +1,53 @@
+name: Dispatch Downstream CI
+
+# 内核 tag（vX.Y.Z）发布后，自动触发两个客户端仓的 CI：
+#   Android  / callacat/x-tunnel-android
+#   Windows  / callacat/x-tunnel-windows
+# 客户端 CI 以 actions/checkout ref=CORE_REF 锚定内核 tag（见各仓 ci.yml），
+# 确保发布的客户端 sidecar 与内核 Release 资产同源。
+# 依赖：下游仓 ci.yml 已声明 workflow_dispatch 触发；本仓 Actions secret
+#       DOWNSTREAM_DISPATCH_TOKEN（需东哥配置：PAT，repo + workflow scope）。
+#       未配置该 secret 时本 workflow 不失败，仅警告跳过（见各步骤 guard）。
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch x-tunnel-android CI
+        run: |
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "::warning::未配置 DOWNSTREAM_DISPATCH_TOKEN secret（需东哥在 callacat/x-tunnel 仓库 Actions secrets 配置 repo+workflow scope 的 PAT）——本次跳过下游 CI 触发，不失败。"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d '{"ref":"main"}' \
+            "https://api.github.com/repos/callacat/x-tunnel-android/actions/workflows/ci.yml/dispatches"
+        env:
+          DISPATCH_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
+
+      - name: Dispatch x-tunnel-windows CI
+        run: |
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "::warning::未配置 DOWNSTREAM_DISPATCH_TOKEN secret（需东哥在 callacat/x-tunnel 仓库 Actions secrets 配置 repo+workflow scope 的 PAT）——本次跳过下游 CI 触发，不失败。"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d '{"ref":"main"}' \
+            "https://api.github.com/repos/callacat/x-tunnel-windows/actions/workflows/ci.yml/dispatches"
+        env:
+          DISPATCH_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
