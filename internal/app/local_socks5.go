@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -13,6 +14,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+// round43：DNS 源分流的两个解析出口。
+// tunnelDNSHost 境外域名走隧道解析（境外视角无污染）；directDNSHost 国内
+// 域名直连解析（国内 CDN 视角）。与 Android VpnDataPathController 的
+// GEO_DNS(223.5.5.5) 对应。
+const (
+	tunnelDNSHost = "1.1.1.1"
+	directDNSHost = "223.5.5.5"
 )
 
 type ProxyConfig struct {
@@ -33,6 +43,9 @@ type UDPAssociation struct {
 	channelID int
 	target    string
 	stream    *V3CipherStream
+	// round41：UDP DIRECT 出口——GEO 分流判定 direct 的 UDP 目标（如国内
+	// DNS 223.5.5.5:53）经本机 socket 直发，不占隧道。nil = 走隧道（现状）。
+	directConn *net.UDPConn
 }
 
 func parseAuthAndAddr(full string) (string, string, string, error) {
@@ -300,6 +313,29 @@ func handleSOCKS5UserPassAuth(c net.Conn, cfgp *ProxyConfig) error {
 }
 
 func handleSOCKS5Connect(c net.Conn, target string) {
+	// 分流判定（§1.2）：host 拆端口供 Match；ATYP=域名直用，IP 字面量先查
+	// DNS 嗅探映射还原域名（§2.2），miss 则只走 geoip。
+	host, _, _ := net.SplitHostPort(target)
+	routeHost, routeIP := routeRT.resolveHostForRoute(host)
+	switch decideForTarget(routeHost, routeIP) {
+	case routeDirect:
+		handleDirectConnect(c, target)
+		return
+	case routeReject:
+		_ = writeSOCKS5Reply(c, 0x02)
+		_ = c.Close()
+		return
+	}
+
+	// round47：裸 IP:443 进隧道前的 SNI 嗅探改写（详见 handleSNIProxyConnect）。
+	// 分流判定用原 IP（geoip 语义保持不变）；改写为 SNI 域名后不二次判定，
+	// TODO(round47)：后续可再按 SNI 域名重判（SNI 可能命中与 IP geoip 不同的
+	// 规则），本轮不做。
+	if sniSniff && sniCandidate(target) {
+		handleSNIProxyConnect(c, target)
+		return
+	}
+
 	stream, _, decision, err := echPool.openTCPStream(target)
 	if err != nil {
 		log.Printf("[客户端] %s SOCKS5 打开失败 %s: %v", clientSourceAddr(c), target, err)
@@ -315,6 +351,90 @@ func handleSOCKS5Connect(c net.Conn, target string) {
 	logClientConnEvent(c, "SOCKS5", target, decision, true)
 	defer logClientConnEvent(c, "SOCKS5", target, decision, false)
 	proxyConnStream(c, stream)
+}
+
+// sniCandidate 判定 target 是否值得 SNI 嗅探：IP 字面量 + 443 端口。
+// 域名 target / 非 443（明文协议为主、无 SNI 可提）一律不值得。
+func sniCandidate(target string) bool {
+	host, portStr, err := net.SplitHostPort(target)
+	return err == nil && portStr == "443" && net.ParseIP(host) != nil
+}
+
+// handleSNIProxyConnect 处理「IP:443 + proxy 分支」连接的 SNI 嗅探改写。
+//
+// 顺序与标准 SOCKS5 服务器不同（sing-box 同款语义）：**先回 0x00 再嗅探**。
+// 原因：hev tun2socks（hev-socks5-core 标准握手 write_request → read_response
+// 之后才 splice TUN 数据；Android 侧 tun2socks.yml 未开 pipeline）必须先收到
+// 成功回复才把 TUN 缓存的 ClientHello 发上来——「先嗅探后回复」会让 Peek 永远
+// 空等到 1s deadline，改写永不生效且每个 IP:443 连接平白多 1 秒延迟。
+// 代价：edge 打开失败时已回过 0x00，无法再回 SOCKS5 错误码，只能关连接——
+// TLS 客户端把 reset 当连接失败自行重试/回退（Happy Eyeballs），与 sing-box
+// 行为一致；仅此路径（IP:443）如此，其余路径保持「先开后回」的精确错误码。
+func handleSNIProxyConnect(c net.Conn, target string) {
+	if err := writeSOCKS5Reply(c, 0x00); err != nil {
+		_ = c.Close()
+		return
+	}
+	target, conn := sniffSNITarget(c, target)
+	stream, _, decision, err := echPool.openTCPStream(target)
+	if err != nil {
+		log.Printf("[客户端] %s SOCKS5 打开失败 %s: %v", clientSourceAddr(conn), target, err)
+		_ = conn.Close()
+		return
+	}
+	logClientConnEvent(conn, "SOCKS5", target, decision, true)
+	defer logClientConnEvent(conn, "SOCKS5", target, decision, false)
+	proxyConnStream(conn, stream)
+}
+
+// sniffSNITarget 是 round47「裸 IP 进隧道」的首包嗅探：目标为 IP 字面量 :443
+// 时读首个 TLS ClientHello，提取 SNI 域名，命中则把 target 改写为 domain:443
+// 发服务器——服务端境外视角解析（无污染）且 MIhomo 域名分流（geosite/domain）
+// 恢复生效。
+//
+// 背景：Android 系统 DNS 走 DoT:853 加密后 sidecar 的 UDP:53 嗅探失效、
+// IP→域名映射全空，CONNECT 目标全是裸 IP（r46 真机实锤：服务端 MIhomo
+// 大量 context deadline exceeded）。
+//
+// 嗅探带 1s 读 deadline：客户端不发/慢发首包时不被 Peek 卡死，超时按「无 SNI」
+// 处理继续用原 IP target。已 Peek 进缓冲的字节（命中改写的完整首包、非 TLS 的
+// 部分/全部字节、截断记录）一律经 bufferedConn 回放给后续 proxyConnStream，
+// 保证首包不丢——所有提前返回路径都必须走 replay()，否则已读字节丢失。
+func sniffSNITarget(c net.Conn, target string) (string, net.Conn) {
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil || net.ParseIP(host) == nil || portStr != "443" {
+		return target, c
+	}
+	br := bufio.NewReader(c)
+	// 嗅探只等 1s：慢发/不发首包的连接不被卡住，超时按无 SNI 处理。
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	defer c.SetReadDeadline(time.Time{}) // 无论命中与否都恢复，正常双向转发
+	// replay 把 Peek 已吞进缓冲的字节包回连接；缓冲为空时原样返回。
+	replay := func() net.Conn {
+		if br.Buffered() > 0 {
+			return &bufferedConn{Conn: c, reader: br}
+		}
+		return c
+	}
+	head, err := br.Peek(5)
+	if err != nil || head[0] != 0x16 { // 非 TLS（如明文 HTTP 直连 443）
+		return target, replay()
+	}
+	// TLS record header：type(1) + version(2) + length(2) 大端；首包一般很小
+	// （ClientHello），recLen 上限 64KiB 防御异常大记录。
+	recLen := int(head[3])<<8 | int(head[4])
+	if recLen <= 0 || recLen >= 64*1024 {
+		return target, replay()
+	}
+	payload, err := br.Peek(5 + recLen)
+	if err != nil {
+		return target, replay()
+	}
+	if sni, ok := sniffSNI(payload); ok && sni != host {
+		log.Printf("[客户端] %s SNI 改写 %s -> %s", clientSourceAddr(c), target, net.JoinHostPort(sni, "443"))
+		return net.JoinHostPort(sni, "443"), &bufferedConn{Conn: c, reader: br}
+	}
+	return target, replay()
 }
 
 func handleSOCKS5UDP(c net.Conn, cfgp *ProxyConfig) {
@@ -401,6 +521,38 @@ func (a *UDPAssociation) loop() {
 }
 
 func (a *UDPAssociation) send(target string, data []byte) {
+	// round45：DNS 源分流（r43 语义反转修正，r44 真机实锤全断根因）。
+	// 目标 :53 的 DNS 查询先解出 QNAME，按域名规则判定解析源：
+	//   - 明确命中 proxy 规则的域名（geosite:google / geolocation-!cn 等）→
+	//     改写目标 1.1.1.1:53 走隧道解析（境外视角，防污染）
+	//   - **其余全部（direct 命中 / 规则未命中 / GEO 库未就绪）→ 国内直连解析
+	//     223.5.5.5**——保底可达。r43 把「未命中」也推到隧道 DNS，GEO 库缺失时
+	//     国内域名全被改写走隧道；隧道 UDP DNS 一旦不稳（r44 实锤：assoc 开着
+	//     5.9s 无回包）= 所有域名解析失败 = 完全断网。
+	//   - 引擎未启用（GEO off）→ 保持客户端原目标不动（现状零回归）。
+	host, portStr, _ := net.SplitHostPort(target)
+	if portStr == "53" && routeRT.engineSnapshot() != nil {
+		if qname, ok := sniffDNSQuery(data); ok && shouldTunnelDNS(qname) {
+			// 明确 proxy 的境外域名：走隧道解析（无污染视角）。
+			if rewritten := net.JoinHostPort(tunnelDNSHost, "53"); rewritten != target {
+				target = rewritten
+				host = tunnelDNSHost
+			}
+		} else if ok && host != directDNSHost {
+			// direct 命中 / 未命中 / 库未就绪：国内直连解析（保底可达，r45）。
+			target = net.JoinHostPort(directDNSHost, "53")
+			host = directDNSHost
+		}
+	}
+	// round41：UDP 分流判定。GEO 引擎启用且目标判定 direct（国内 DNS/国内 UDP
+	// 服务）→ 本机 socket 直发（不占隧道）；其余/引擎未启用 → 走隧道（现状）。
+	// DNS 响应同样会在 direct 路径上被嗅探（写 IP→域名映射）。
+	routeHost, routeIP := routeRT.resolveHostForRoute(host)
+	if decideForTarget(routeHost, routeIP) == routeDirect {
+		a.sendDirect(target, data)
+		return
+	}
+
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -453,6 +605,108 @@ func (a *UDPAssociation) send(target string, data []byte) {
 	}
 }
 
+// sendDirect 是 UDP 的 DIRECT 出口（round41）：目标地址解析后用独立本机
+// UDP socket 直发，起一个 goroutine 读响应回写客户端（含 DNS 嗅探）。
+// socket 按目标懒创建；目标变更时重建（UDPAssociation 本身绑定单目标，
+// 上游 send 已挡不同 target，这里防御性处理）。
+func (a *UDPAssociation) sendDirect(target string, data []byte) {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return
+	}
+	conn := a.directConn
+	boundTo := a.target
+	needStart := conn == nil || (boundTo != "" && boundTo != target)
+	a.mu.Unlock()
+
+	if needStart {
+		raddr, err := net.ResolveUDPAddr("udp", target)
+		if err != nil {
+			log.Printf("[客户端] %s UDP-DIRECT 解析目标失败 %s: %v", clientSourceAddr(a.tcpConn), target, err)
+			return
+		}
+		// 绑定与客户端 listener 同一地址族（v4 目标绑 v4 通配，避免HappyEyeballs问题）。
+		laddr := &net.UDPAddr{Port: 0}
+		if raddr.IP.To4() == nil {
+			laddr.IP = net.IPv6unspecified
+		}
+		nc, err := net.ListenUDP("udp", laddr)
+		if err != nil {
+			log.Printf("[客户端] %s UDP-DIRECT 建立失败 %s: %v", clientSourceAddr(a.tcpConn), target, err)
+			return
+		}
+		a.mu.Lock()
+		if a.directConn != nil && a.directConn != nc {
+			_ = a.directConn.Close()
+		}
+		a.directConn = nc
+		a.mu.Unlock()
+		conn = nc
+		log.Printf("[客户端] udp_assoc=%d UDP-DIRECT 绑定目标 %s 本地 %s", a.id, target, nc.LocalAddr())
+		go a.directReadLoop(nc)
+	}
+	if conn == nil {
+		return
+	}
+	raddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return
+	}
+	if _, err := conn.WriteToUDP(data, raddr); err != nil {
+		log.Printf("[客户端] udp_assoc=%d UDP-DIRECT 写入失败 %s: %v", a.id, target, err)
+	}
+}
+
+// directReadLoop 读 DIRECT socket 的响应，组 SOCKS5 UDP 帧回写客户端；
+// DNS（端口 53）响应走嗅探写 IP→域名映射。
+func (a *UDPAssociation) directReadLoop(conn *net.UDPConn) {
+	buf := make([]byte, 65535)
+	for {
+		conn.SetReadDeadline(time.Now().Add(cfg.UDPReadTimeout))
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				// 空闲超时不关 socket（保持直发通道），继续等下一包。
+				continue
+			}
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		if from != nil && from.Port == 53 {
+			if qname, ips := sniffDNSAnswers(payload); qname != "" {
+				for _, ip := range ips {
+					rememberHostFromDNS(ip, qname)
+				}
+			}
+		}
+		host := ""
+		if from != nil {
+			host = from.IP.String()
+		}
+		port := 0
+		if from != nil {
+			port = from.Port
+		}
+		pkt, err := buildSOCKS5UDPPacket(host, port, payload)
+		if err != nil {
+			continue
+		}
+		a.mu.Lock()
+		client := a.clientUDPAddr
+		closed := a.closed
+		a.mu.Unlock()
+		if closed || client == nil {
+			return
+		}
+		_, _ = writeUDPDatagram(a.udpListener, pkt, client)
+	}
+}
+
 func (a *UDPAssociation) handleUDPResponse(addrStr string, data []byte) {
 	host, portStr, err := net.SplitHostPort(addrStr)
 	if err != nil {
@@ -461,6 +715,16 @@ func (a *UDPAssociation) handleUDPResponse(addrStr string, data []byte) {
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return
+	}
+	// §2.2 DNS 嗅探：响应侧从 DNS 报文提取 QNAME + A/AAAA 答案，写入 IP→域名
+	// 映射（routeRT.remember），使后续 SOCKS5/HTTP 的 IP 字面量目标能反查域名
+	// 命中 geosite/domain 规则。旁路观察，不改动数据流；引擎未启用时跳过。
+	if routeRT.engineSnapshot() != nil && port == 53 {
+		if qname, ips := sniffDNSAnswers(data); qname != "" {
+			for _, ip := range ips {
+				rememberHostFromDNS(ip, qname)
+			}
+		}
 	}
 	pkt, err := buildSOCKS5UDPPacket(host, port, data)
 	if err != nil {
@@ -482,8 +746,10 @@ func (a *UDPAssociation) Close() {
 	stream := a.stream
 	target := a.target
 	chID := a.channelID
+	directConn := a.directConn
 	a.closed = true
 	a.stream = nil
+	a.directConn = nil
 	active := a.active
 	a.active = false
 	a.mu.Unlock()
@@ -492,6 +758,9 @@ func (a *UDPAssociation) Close() {
 	}
 	if stream != nil {
 		_ = stream.Close()
+	}
+	if directConn != nil {
+		_ = directConn.Close() // 中断 directReadLoop
 	}
 	if chID > 0 && target != "" {
 		log.Printf("[客户端] udp_assoc=%d SOCKS5-UDP 关联关闭 target=%s 通道 %d", a.id, target, chID)

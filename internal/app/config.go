@@ -35,6 +35,7 @@ type GlobalConfig struct {
 	ShutdownTimeout    time.Duration
 	AuthSkew           time.Duration
 	PreAuthTimeout     time.Duration
+	DNSCacheTTL        time.Duration
 
 	ReadBuf int
 }
@@ -53,6 +54,7 @@ func defaultGlobalConfig() GlobalConfig {
 		ShutdownTimeout:    5 * time.Second,
 		AuthSkew:           5 * time.Minute,
 		PreAuthTimeout:     5 * time.Second,
+		DNSCacheTTL:        5 * time.Minute,
 		ReadBuf:            64 * 1024,
 	}
 }
@@ -152,10 +154,17 @@ var (
 	checkConfigFile     string
 	formatConfigFile    string
 
-	dnsServer string
-	enableECH bool
-	echDomain string
-	fallback  bool
+	dnsServer    string
+	enableECH    bool
+	echDomain    string
+	fallback     bool
+	rulesPath    string
+	geoDir       string
+	routeEnabled bool
+	// round47：对裸 IP:443 的 proxy 连接嗅探 TLS ClientHello 的 SNI 改写域名目标
+	// （DoT/DoH 加密 DNS 绕过 UDP:53 嗅探导致 IP→域名映射全空的兜底）。默认开，
+	// -sni=false 关闭。
+	sniSniff bool
 
 	cipherPrefStr        string
 	pacingRateMbps       float64
@@ -270,6 +279,10 @@ func init() {
 	flag.StringVar(&controlTokenFile, "control-token-file", "", "可选控制 API bearer token 文件路径，需配合 -control 使用")
 	flag.StringVar(&checkConfigFile, "check-config", "", "离线校验 JSON 配置文件并退出；使用 - 从 stdin 读取")
 	flag.StringVar(&formatConfigFile, "format-config", "", "离线格式化 JSON 配置文件到 stdout 并退出；使用 - 从 stdin 读取")
+	flag.StringVar(&rulesPath, "rules-path", "", "可选分流规则文件路径（route-enabled 时必填或自动写默认模板）")
+	flag.StringVar(&geoDir, "geo-dir", "", "可选 GEO 数据库目录（geosite.dat / geoip-lite.dat）")
+	flag.BoolVar(&routeEnabled, "route-enabled", false, "是否启用分流引擎（GEO/域名规则）；服务端默认关闭")
+	flag.BoolVar(&sniSniff, "sni", true, "对裸 IP:443 的 proxy 连接嗅探 TLS SNI 改写域名目标（round47：DoT/DoH 加密 DNS 绕过 UDP:53 嗅探导致 IP→域名映射全空的兜底；默认开，-sni=false 关闭）")
 	flag.DurationVar(&cfg.DialTimeout, "dial-timeout", cfg.DialTimeout, "TCP/DNS 目标拨号超时时间")
 	flag.DurationVar(&cfg.WSHandshakeTimeout, "ws-handshake-timeout", cfg.WSHandshakeTimeout, "WebSocket 握手超时时间")
 	flag.DurationVar(&cfg.ReconnectDelay, "reconnect-delay", cfg.ReconnectDelay, "客户端重连初始退避时间")
@@ -277,6 +290,7 @@ func init() {
 	flag.DurationVar(&cfg.ReconnectJitter, "reconnect-jitter", cfg.ReconnectJitter, "客户端重连随机抖动上限")
 	flag.DurationVar(&cfg.RTTProbeTimeout, "rtt-timeout", cfg.RTTProbeTimeout, "通道 RTT 探测超时时间")
 	flag.DurationVar(&cfg.DNSQueryTimeout, "dns-timeout", cfg.DNSQueryTimeout, "ECH DNS 查询超时时间")
+	flag.DurationVar(&cfg.DNSCacheTTL, "dns-cache-ttl", cfg.DNSCacheTTL, "服务端/-ip 主机解析结果缓存时长（0=禁用缓存）")
 	flag.DurationVar(&cfg.ECHRetryDelay, "ech-retry-delay", cfg.ECHRetryDelay, "ECH 查询/刷新失败后的重试等待时间")
 	flag.DurationVar(&cfg.UDPReadTimeout, "udp-read-timeout", cfg.UDPReadTimeout, "服务端 UDP relay 读轮询超时时间")
 	flag.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", cfg.ShutdownTimeout, "收到退出信号后的优雅关闭超时时间")
@@ -346,11 +360,16 @@ type FileConfig struct {
 	ReconnectJitter       *string                    `json:"reconnect_jitter"`
 	RTTProbeTimeout       *string                    `json:"rtt_timeout"`
 	DNSQueryTimeout       *string                    `json:"dns_timeout"`
+	DNSCacheTTL           *string                    `json:"dns_cache_ttl"`
 	ECHRetryDelay         *string                    `json:"ech_retry_delay"`
 	UDPReadTimeout        *string                    `json:"udp_read_timeout"`
 	ShutdownTimeout       *string                    `json:"shutdown_timeout"`
 	AuthSkew              *string                    `json:"auth_skew"`
 	PreAuthTimeout        *string                    `json:"preauth_timeout"`
+	RulesPath             *string                    `json:"rules_path"`
+	GeoDir                *string                    `json:"geo_dir"`
+	RouteEnabled          *bool                      `json:"route_enabled"`
+	SNI                   *bool                      `json:"sni"`
 }
 
 func visitedFlags() map[string]bool {
@@ -398,6 +417,10 @@ type runtimeValues struct {
 	CoverTraffic        bool
 	Global              GlobalConfig
 	WebSocketFrontProxy WebSocketFrontProxyConfig
+	RulesPath           string
+	GeoDir              string
+	RouteEnabled        bool
+	SNISniff            bool
 }
 
 type RuntimeConfig struct {
@@ -442,6 +465,10 @@ func currentRuntimeValues() runtimeValues {
 		CoverTraffic:        coverTraffic,
 		Global:              cfg,
 		WebSocketFrontProxy: cloneWebSocketFrontProxyConfig(websocketFrontProxyConfig),
+		RulesPath:           rulesPath,
+		GeoDir:              geoDir,
+		RouteEnabled:        routeEnabled,
+		SNISniff:            sniSniff,
 	}
 }
 
@@ -462,6 +489,7 @@ func defaultRuntimeValues() runtimeValues {
 		EnableDatagram:    true,
 		CoverTraffic:      false,
 		Global:            defaultGlobalConfig(),
+		SNISniff:          true,
 	}
 }
 
@@ -500,6 +528,10 @@ func (values runtimeValues) applyGlobals() {
 	coverTraffic = values.CoverTraffic
 	cfg = values.Global
 	websocketFrontProxyConfig = cloneWebSocketFrontProxyConfig(values.WebSocketFrontProxy)
+	rulesPath = values.RulesPath
+	geoDir = values.GeoDir
+	routeEnabled = values.RouteEnabled
+	sniSniff = values.SNISniff
 }
 
 func newRuntimeConfig(values runtimeValues, startup *startupConfig) RuntimeConfig {
@@ -718,6 +750,14 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 	if err := applyNonNegativeIntConfig(seen, "shaping-coalesce-ms", shapingCoalesceVal, &values.ShapingCoalesceMs); err != nil {
 		return err
 	}
+	applyStringConfig(seen, "rules-path", fc.RulesPath, &values.RulesPath)
+	applyStringConfig(seen, "geo-dir", fc.GeoDir, &values.GeoDir)
+	if fc.RouteEnabled != nil && !seen["route-enabled"] {
+		values.RouteEnabled = *fc.RouteEnabled
+	}
+	if fc.SNI != nil && !seen["sni"] {
+		values.SNISniff = *fc.SNI
+	}
 	if fc.Connections != nil && !seen["n"] {
 		values.ConnectionNum = *fc.Connections
 	}
@@ -767,6 +807,9 @@ func applyConfigJSONToValues(raw []byte, seen map[string]bool, values *runtimeVa
 		return err
 	}
 	if err := applyDurationConfig(seen, "dns-timeout", fc.DNSQueryTimeout, &values.Global.DNSQueryTimeout); err != nil {
+		return err
+	}
+	if err := applyNonNegativeDurationConfig(seen, "dns-cache-ttl", fc.DNSCacheTTL, &values.Global.DNSCacheTTL); err != nil {
 		return err
 	}
 	if err := applyDurationConfig(seen, "ech-retry-delay", fc.ECHRetryDelay, &values.Global.ECHRetryDelay); err != nil {
@@ -1079,12 +1122,16 @@ func validateDialIPOverride(value string) error {
 			return fmt.Errorf("port 必须在 1-65535 之间")
 		}
 		if net.ParseIP(host) == nil {
-			return fmt.Errorf("host 必须是 IP 地址")
+			if err := validateDNSName(host); err != nil {
+				return fmt.Errorf("host 必须是 IP 地址或合法主机名: %w", err)
+			}
 		}
 		return nil
 	}
 	if net.ParseIP(value) == nil {
-		return fmt.Errorf("必须是 IP 地址或 IP:port")
+		if err := validateDNSName(value); err != nil {
+			return fmt.Errorf("必须是 IP 地址、IP:port 或合法主机名: %w", err)
+		}
 	}
 	return nil
 }

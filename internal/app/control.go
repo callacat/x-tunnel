@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"x-tunnel/internal/route"
 )
 
 type controlServer struct {
@@ -80,6 +82,10 @@ func startControlServer(ctx context.Context, engine *Engine, addr, tokenFile str
 	mux.Handle("/v1/config/check", control.requireAuth(http.HandlerFunc(control.handleConfigCheck)))
 	mux.Handle("/v1/config/format", control.requireAuth(http.HandlerFunc(control.handleConfigFormat)))
 	mux.Handle("/v1/runtime/stop", control.requireAuth(http.HandlerFunc(control.handleStop)))
+	mux.Handle("/v1/rules", control.requireAuth(http.HandlerFunc(control.handleRules)))
+	mux.Handle("/v1/rules/reload", control.requireAuth(http.HandlerFunc(control.handleRulesReload)))
+	mux.Handle("/v1/route/geo/update", control.requireAuth(http.HandlerFunc(control.handleGeoUpdate)))
+	mux.Handle("/v1/route/stats", control.requireAuth(http.HandlerFunc(control.handleRouteStats)))
 	control.server = &http.Server{Handler: mux}
 	control.listener = newRuntimeListener("control", addr, control.baseURL, func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), engine.config.values.Global.ShutdownTimeout)
@@ -359,6 +365,99 @@ func (s *controlServer) handleStop(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		_ = s.engine.Close(ctx)
 	}()
+}
+
+// handleRules 返回当前生效的规则列表 + 引擎是否启用（读）。
+func (s *controlServer) handleRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
+		return
+	}
+	engine, enabled := s.engine.routeSnapshot()
+	if engine == nil {
+		writeControlJSON(w, http.StatusOK, map[string]any{"enabled": enabled, "rules": []route.Rule{}})
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"enabled": true, "rules": engine.Rules()})
+}
+
+// handleRulesReload 手动重新加载规则文件（写）。
+func (s *controlServer) handleRulesReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
+		return
+	}
+	engine, enabled := s.engine.routeSnapshot()
+	if engine == nil {
+		writeControlError(w, http.StatusConflict, "route.disabled", "分流引擎未启用", "")
+		return
+	}
+	if err := engine.Reload(); err != nil {
+		writeControlError(w, http.StatusBadRequest, "route.reload_failed", err.Error(), "")
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": enabled, "rules": engine.Rules()})
+}
+
+// handleGeoUpdate 手动触发 GEO 数据库更新（下载 + 热加载，写）。
+// round40：Android「立即更新」按钮与此对接；同步执行（下载最多 5 分钟，
+// Android 侧设了更短的读超时会先超时——但更新仍在后台继续，状态可从
+// /v1/route/stats 的 geo 字段轮询到）。
+func (s *controlServer) handleGeoUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
+		return
+	}
+	engine, _ := s.engine.routeSnapshot()
+	if engine == nil {
+		writeControlError(w, http.StatusConflict, "route.disabled", "分流引擎未启用", "")
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if updated, err := engine.UpdateGeo(ctx); err != nil {
+			log.Printf("[分流] 手动 GEO 更新失败：%v", err)
+		} else if updated {
+			log.Printf("[分流] 手动 GEO 更新完成（有新内容）")
+		} else {
+			log.Printf("[分流] 手动 GEO 更新完成（已是最新）")
+		}
+	}()
+	writeControlJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// handleRouteStats 返回分流命中统计 + GEO 库状态（读）。round40 可观测性：
+// Android 诊断包/状态卡据此展示「GEO 库是否就绪、规则条数、命中计数」，
+// 替代原先 route_stats 全 -1 的黑盒。
+func (s *controlServer) handleRouteStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeControlError(w, http.StatusMethodNotAllowed, "http.method_not_allowed", "method not allowed", "")
+		return
+	}
+	engine, _ := s.engine.routeSnapshot()
+	if engine == nil {
+		writeControlJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"stats":   route.Stats{},
+			"geo":     route.GeoStatus{},
+		})
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{
+		"enabled": true,
+		"stats":   engine.Stats(),
+		"geo":     engine.GeoStatus(),
+	})
+}
+
+// routeSnapshot 返回分流引擎引用与启用标志（并发安全读）。
+func (e *Engine) routeSnapshot() (*route.Engine, bool) {
+	e.mu.Lock()
+	engine := e.routeEngine
+	enabled := e.config.values.RouteEnabled
+	e.mu.Unlock()
+	return engine, enabled
 }
 
 type controlError struct {
