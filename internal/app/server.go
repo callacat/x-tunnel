@@ -790,7 +790,7 @@ func handlePreAuthTransportSession(sess transport.TransportSession, closer io.Cl
 		if closer != nil {
 			_ = closer.Close()
 		}
-		log.Printf("[服务端] v3 认证失败，来源 IP: %s", clientIP)
+		log.Printf("[服务端] v3 认证失败, serverName=%q path=%q session=%x channel=%d ts=%d caps=0x%x 来源 IP: %s（最可能原因：token 不一致、服务端/客户端 wire 版本代差，或经反代/CF 时 Host 与客户端 -f 的 hostname 不一致）", serverName, path, init.SessionID, init.ChannelID, init.Timestamp, init.Capabilities, clientIP)
 		return
 	}
 	if serverNonceCache.seenOrStore(init.SessionID, init.ChannelID, init.ClientNonce, now, cfg.AuthSkew) {

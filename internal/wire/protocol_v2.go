@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
+	"os"
 	"time"
 
 	"golang.org/x/crypto/hkdf"
@@ -494,7 +496,11 @@ func computeV2AuthProof(token, serverName, path string, init ChannelInit) ([]byt
 	}
 	mac := hmac.New(sha256.New, authKey)
 	_, _ = mac.Write(transcript)
-	return mac.Sum(nil), nil
+	proof := mac.Sum(nil)
+	if os.Getenv("XT_DEBUG_AUTH") != "" {
+		log.Printf("[auth-debug] compute: serverName=%q path=%q sessionID=%x channelID=%d nonce=%x ts=%d caps=0x%x transcript=%x proof=%x", serverName, path, init.SessionID, init.ChannelID, init.ClientNonce, init.Timestamp, init.Capabilities, transcript, proof)
+	}
+	return proof, nil
 }
 
 func verifyV2AuthProof(token, serverName, path string, init ChannelInit) bool {
@@ -508,7 +514,11 @@ func verifyV2AuthProof(token, serverName, path string, init ChannelInit) bool {
 	if err != nil {
 		return false
 	}
-	return hmac.Equal(want, init.AuthProof)
+	ok := hmac.Equal(want, init.AuthProof)
+	if os.Getenv("XT_DEBUG_AUTH") != "" {
+		log.Printf("[auth-debug] verify: serverName=%q path=%q sessionID=%x channelID=%d nonce=%x ts=%d caps=0x%x want=%x got=%x ok=%v", serverName, path, init.SessionID, init.ChannelID, init.ClientNonce, init.Timestamp, init.Capabilities, want, init.AuthProof, ok)
+	}
+	return ok
 }
 
 func channelInitTranscript(serverName, path string, init ChannelInit) ([]byte, error) {

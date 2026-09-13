@@ -564,9 +564,9 @@ func negotiateClientProtocol(sessAny any, timeout time.Duration, clientID string
 	if reject.Code != 0 {
 		if reject.Code == v2RejectAuthenticationFailed {
 			if reject.Message != "" {
-				return 0, V3SessionKeys{}, 0, fmt.Errorf("认证失败: %s", reject.Message)
+				return 0, V3SessionKeys{}, 0, fmt.Errorf("认证失败: %s（若服务端为 v3 协议，需升级服务端或改用同一 wire 版本的客户端；若经反代/CF，请核对客户端 -f 的 hostname/path 与反代透传的 Host 一致）", reject.Message)
 			}
-			return 0, V3SessionKeys{}, 0, fmt.Errorf("认证失败")
+			return 0, V3SessionKeys{}, 0, fmt.Errorf("认证失败（若服务端为 v3 协议，需升级服务端或改用同一 wire 版本的客户端；若经反代/CF，请核对客户端 -f 的 hostname/path 与反代透传的 Host 一致）")
 		}
 		if reject.Message != "" {
 			return 0, V3SessionKeys{}, 0, fmt.Errorf("协议协商失败: reject=%d %s", reject.Code, reject.Message)
