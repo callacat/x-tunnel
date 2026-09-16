@@ -62,7 +62,17 @@ func handleHTTP(c net.Conn, cfgp *ProxyConfig) {
 			return
 		}
 	}
-	sanitizeHTTPProxyRequest(req)
+	// 协议升级请求（WS 等）整段透传 hop-by-hop 头（仅去代理专用头），保持
+	// 端到端 Upgrade 语义——stripHTTPProxyHeaders 会剥 Upgrade/Connection，
+	// 导致经代理的 WS 握手降级为普通 GET（recvvlI1JMNbc7 现网 webssh 故障）。
+	upgradeRequest := isHTTPUpgradeRequest(req.Header)
+	if upgradeRequest {
+		req.Header.Del("Proxy-Authorization")
+		req.Header.Del("Proxy-Connection")
+		req.Close = false
+	} else {
+		sanitizeHTTPProxyRequest(req)
+	}
 
 	target, err := httpProxyTarget(req)
 	if err != nil {
@@ -71,7 +81,9 @@ func handleHTTP(c net.Conn, cfgp *ProxyConfig) {
 	}
 
 	if req.Method != "CONNECT" {
-		addHTTPProxyViaHeader(req.Header)
+		if !upgradeRequest {
+			addHTTPProxyViaHeader(req.Header)
+		}
 		req.RequestURI = ""
 		req.URL.Scheme = ""
 		req.URL.Host = ""
@@ -147,6 +159,22 @@ var httpHopByHopHeaders = []string{
 	"Trailer",
 	"Transfer-Encoding",
 	"Upgrade",
+}
+
+// isHTTPUpgradeRequest 判定请求是否为协议升级（WS 等）：Upgrade 头非空，或
+// Connection 头含 upgrade token（部分客户端发 keep-alive, Upgrade 混合形式）。
+func isHTTPUpgradeRequest(h http.Header) bool {
+	if h.Get("Upgrade") != "" {
+		return true
+	}
+	for _, connection := range h.Values("Connection") {
+		for _, token := range strings.Split(connection, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 const httpProxyViaValue = "1.1 x-tunnel"
