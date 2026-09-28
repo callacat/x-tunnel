@@ -31,8 +31,8 @@ func TestQuicEndToEndTCPForward(t *testing.T) {
 	targetAddr := strings.TrimPrefix(origin.URL, "http://")
 
 	binPath := buildIntegrationBinary(t, ctx)
-	wssAddr := freeTCPAddr(t)
-	tcpAddr := freeTCPAddr(t)
+	wssAddr := reserveTCPAddr(t)
+	tcpAddr := reserveTCPAddr(t)
 
 	serverLog := t.TempDir() + "/server.log"
 	clientLog := t.TempDir() + "/client.log"
@@ -72,8 +72,8 @@ func TestQuicClientChannelUpMetric(t *testing.T) {
 	defer cancel()
 
 	binPath := buildIntegrationBinary(t, ctx)
-	wssAddr := freeTCPAddr(t)
-	clientMetricsAddr := freeTCPAddr(t)
+	wssAddr := reserveTCPAddr(t)
+	clientMetricsAddr := reserveTCPAddr(t)
 
 	serverLog := t.TempDir() + "/server.log"
 	clientLog := t.TempDir() + "/client.log"
@@ -89,7 +89,7 @@ func TestQuicClientChannelUpMetric(t *testing.T) {
 	waitLogContains(t, ctx, serverLog, "QUIC 启动", server)
 
 	client := startXTunnel(t, ctx, binPath, clientLog,
-		"-l", "socks5://"+freeTCPAddr(t),
+		"-l", "socks5://"+reserveTCPAddr(t),
 		"-f", "wss://"+wssAddr+"/tunnel",
 		"-token", "quic-metrics-token",
 		"-n", "1",
@@ -120,8 +120,8 @@ func TestDualStackAutoFallback(t *testing.T) {
 	targetAddr := strings.TrimPrefix(origin.URL, "http://")
 
 	binPath := buildIntegrationBinary(t, ctx)
-	wsAddr := freeTCPAddr(t)
-	tcpAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	tcpAddr := reserveTCPAddr(t)
 
 	serverLog := t.TempDir() + "/server-ws.log"
 	clientLog := t.TempDir() + "/client-fallback.log"
@@ -298,7 +298,7 @@ func TestQuicSeparatePortEndToEnd(t *testing.T) {
 	targetAddr := strings.TrimPrefix(origin.URL, "http://")
 
 	binPath := buildIntegrationBinary(t, ctx)
-	wssAddr := freeTCPAddr(t)
+	wssAddr := reserveTCPAddr(t)
 	quicPort := freeUDPPort(t)
 	_, wssPort, err := net.SplitHostPort(wssAddr)
 	if err != nil {
@@ -323,7 +323,7 @@ func TestQuicSeparatePortEndToEnd(t *testing.T) {
 
 	for _, mode := range []string{"auto", "quic"} {
 		t.Run(mode, func(t *testing.T) {
-			tcpAddr := freeTCPAddr(t)
+			tcpAddr := reserveTCPAddr(t)
 			clientLog := t.TempDir() + "/client-sep-" + mode + ".log"
 			client := startXTunnel(t, ctx, binPath, clientLog,
 				"-l", "tcp://"+tcpAddr+"/"+targetAddr,

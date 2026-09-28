@@ -112,7 +112,7 @@ func (l *captureLogger) contains(substr string) bool {
 
 func TestEngineStartCloseReleasesListener(t *testing.T) {
 	values := defaultRuntimeValues()
-	values.ListenAddr = "socks5://" + freeTCPAddr(t)
+	values.ListenAddr = "socks5://" + inProcessTCPAddr(t)
 	values.ForwardAddr = "ws://127.0.0.1:1/tunnel"
 	values.Token = "engine-token"
 	values.ConnectionNum = 1
@@ -164,7 +164,7 @@ func TestEngineStartCloseReleasesListener(t *testing.T) {
 
 func TestEngineCloseBeforeStartDoesNotBlock(t *testing.T) {
 	values := defaultRuntimeValues()
-	values.ListenAddr = "socks5://" + freeTCPAddr(t)
+	values.ListenAddr = "socks5://" + inProcessTCPAddr(t)
 	values.ForwardAddr = "ws://127.0.0.1:1/tunnel"
 	values.Token = "engine-token"
 	values.ConnectionNum = 1
@@ -210,7 +210,7 @@ func TestEngineStartReturnsBindError(t *testing.T) {
 
 func TestReadyAndTokenFilesRequireControl(t *testing.T) {
 	values := defaultRuntimeValues()
-	values.ListenAddr = "socks5://" + freeTCPAddr(t)
+	values.ListenAddr = "socks5://" + inProcessTCPAddr(t)
 	values.ForwardAddr = "ws://127.0.0.1:1/tunnel"
 	values.Token = "engine-token"
 	values.ConnectionNum = 1
@@ -238,7 +238,7 @@ func TestControlAddrRequiresLoopback(t *testing.T) {
 
 func TestControlAPIReadyAuthStatusAndStop(t *testing.T) {
 	values := defaultRuntimeValues()
-	values.ListenAddr = "ws://" + freeTCPAddr(t) + "/tunnel"
+	values.ListenAddr = "ws://" + inProcessTCPAddr(t) + "/tunnel"
 	values.Token = "runtime-secret"
 	config := runtimeConfigForTest(t, values)
 

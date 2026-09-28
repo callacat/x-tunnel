@@ -90,12 +90,12 @@ func TestLocalTunnelIntegration(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 
-	wsAddr := freeTCPAddr(t)
-	socksAddr := freeTCPAddr(t)
-	tcpAddr := freeTCPAddr(t)
-	httpProxyAddr := freeTCPAddr(t)
-	metricsAddr := freeTCPAddr(t)
-	clientMetricsAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	socksAddr := reserveTCPAddr(t)
+	tcpAddr := reserveTCPAddr(t)
+	httpProxyAddr := reserveTCPAddr(t)
+	metricsAddr := reserveTCPAddr(t)
+	clientMetricsAddr := reserveTCPAddr(t)
 
 	serverLog := filepath.Join(t.TempDir(), "server.log")
 	clientLog := filepath.Join(t.TempDir(), "client.log")
@@ -152,7 +152,7 @@ func TestLocalTunnelIntegration(t *testing.T) {
 	)
 
 	badClient := startXTunnel(t, ctx, binPath, badClientLog,
-		"-l", "socks5://"+freeTCPAddr(t),
+		"-l", "socks5://"+reserveTCPAddr(t),
 		"-f", "ws://"+wsAddr+"/tunnel",
 		"-token", "wrong-token",
 		"-n", "1",
@@ -179,9 +179,9 @@ func TestLocalTunnelWithWebSocketFrontProxyIntegration(t *testing.T) {
 	targetAddr := strings.TrimPrefix(origin.URL, "http://")
 
 	binPath := buildIntegrationBinary(t, ctx)
-	wsAddr := freeTCPAddr(t)
-	socksAddr := freeTCPAddr(t)
-	metricsAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	socksAddr := reserveTCPAddr(t)
+	metricsAddr := reserveTCPAddr(t)
 
 	serverLog := filepath.Join(t.TempDir(), "front-proxy-server.log")
 	clientLog := filepath.Join(t.TempDir(), "front-proxy-client.log")
@@ -279,10 +279,10 @@ func TestIntegrationSimulatedCensorProxyAllowsV2Tunnel(t *testing.T) {
 	targetAddr := strings.TrimPrefix(origin.URL, "http://")
 
 	binPath := buildIntegrationBinary(t, ctx)
-	wsAddr := freeTCPAddr(t)
-	socksAddr := freeTCPAddr(t)
-	tcpAddr := freeTCPAddr(t)
-	metricsAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	socksAddr := reserveTCPAddr(t)
+	tcpAddr := reserveTCPAddr(t)
+	metricsAddr := reserveTCPAddr(t)
 
 	serverLog := filepath.Join(t.TempDir(), "censor-server.log")
 	clientLog := filepath.Join(t.TempDir(), "censor-client.log")
@@ -352,9 +352,9 @@ func TestIntegrationLocalProxyAuth(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 
-	wsAddr := freeTCPAddr(t)
-	socksAddr := freeTCPAddr(t)
-	httpProxyAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	socksAddr := reserveTCPAddr(t)
+	httpProxyAddr := reserveTCPAddr(t)
 	serverLog := filepath.Join(t.TempDir(), "proxy-auth-server.log")
 	clientLog := filepath.Join(t.TempDir(), "proxy-auth-client.log")
 
@@ -429,8 +429,8 @@ func TestIntegrationUpstreamSOCKS5Auth(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 
-	okWSAddr := freeTCPAddr(t)
-	okHTTPProxyAddr := freeTCPAddr(t)
+	okWSAddr := reserveTCPAddr(t)
+	okHTTPProxyAddr := reserveTCPAddr(t)
 	okServerLog := filepath.Join(t.TempDir(), "upstream-socks-ok-server.log")
 	okClientLog := filepath.Join(t.TempDir(), "upstream-socks-ok-client.log")
 
@@ -455,8 +455,8 @@ func TestIntegrationUpstreamSOCKS5Auth(t *testing.T) {
 	waitLogContains(t, ctx, okClientLog, "协议协商成功", okClient)
 	assertBody(t, "upstream socks auth", fetchViaHTTPProxy(t, okHTTPProxyAddr, "http://"+targetAddr+"/payload"), body)
 
-	badWSAddr := freeTCPAddr(t)
-	badHTTPProxyAddr := freeTCPAddr(t)
+	badWSAddr := reserveTCPAddr(t)
+	badHTTPProxyAddr := reserveTCPAddr(t)
 	badServerLog := filepath.Join(t.TempDir(), "upstream-socks-bad-server.log")
 	badClientLog := filepath.Join(t.TempDir(), "upstream-socks-bad-client.log")
 
@@ -502,8 +502,8 @@ func TestIntegrationLocalWSSFallback(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 
-	wssAddr := freeTCPAddr(t)
-	tcpAddr := freeTCPAddr(t)
+	wssAddr := reserveTCPAddr(t)
+	tcpAddr := reserveTCPAddr(t)
 	serverLog := filepath.Join(t.TempDir(), "wss-server.log")
 	clientLog := filepath.Join(t.TempDir(), "wss-client.log")
 
@@ -550,8 +550,8 @@ func TestIntegrationLocalWSSMTLS(t *testing.T) {
 	binPath := buildIntegrationBinary(t, ctx)
 	caPath, clientCertPath, clientKeyPath := writeClientMTLSFiles(t)
 
-	wssAddr := freeTCPAddr(t)
-	tcpAddr := freeTCPAddr(t)
+	wssAddr := reserveTCPAddr(t)
+	tcpAddr := reserveTCPAddr(t)
 	serverLog := filepath.Join(t.TempDir(), "mtls-server.log")
 	clientLog := filepath.Join(t.TempDir(), "mtls-client.log")
 	badClientLog := filepath.Join(t.TempDir(), "mtls-bad-client.log")
@@ -568,7 +568,7 @@ func TestIntegrationLocalWSSMTLS(t *testing.T) {
 	waitLogContains(t, ctx, serverLog, "mTLS 客户端证书认证已启用", server)
 
 	badClient := startXTunnel(t, ctx, binPath, badClientLog,
-		"-l", "tcp://"+freeTCPAddr(t)+"/"+targetAddr,
+		"-l", "tcp://"+reserveTCPAddr(t)+"/"+targetAddr,
 		"-f", "wss://"+wssAddr+"/tunnel",
 		"-token", "mtls-token",
 		"-n", "1",
@@ -611,10 +611,10 @@ func TestIntegrationMaxClientsRejectsNewClient(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 
-	wsAddr := freeTCPAddr(t)
-	metricsAddr := freeTCPAddr(t)
-	firstSocksAddr := freeTCPAddr(t)
-	secondSocksAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	metricsAddr := reserveTCPAddr(t)
+	firstSocksAddr := reserveTCPAddr(t)
+	secondSocksAddr := reserveTCPAddr(t)
 	serverLog := filepath.Join(t.TempDir(), "max-clients-server.log")
 	firstClientLog := filepath.Join(t.TempDir(), "max-clients-first.log")
 	secondClientLog := filepath.Join(t.TempDir(), "max-clients-second.log")
@@ -664,8 +664,8 @@ func TestIntegrationSourceCIDRRejectionMetrics(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 
-	wsAddr := freeTCPAddr(t)
-	metricsAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	metricsAddr := reserveTCPAddr(t)
 	serverLog := filepath.Join(t.TempDir(), "source-cidr-server.log")
 
 	server := startXTunnel(t, ctx, binPath, serverLog,
@@ -746,10 +746,10 @@ func TestIntegrationTCPStatusRejectsBlockedTarget(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 
-	wsAddr := freeTCPAddr(t)
-	socksAddr := freeTCPAddr(t)
-	httpProxyAddr := freeTCPAddr(t)
-	metricsAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	socksAddr := reserveTCPAddr(t)
+	httpProxyAddr := reserveTCPAddr(t)
+	metricsAddr := reserveTCPAddr(t)
 	serverLog := filepath.Join(t.TempDir(), "tcp-status-server.log")
 	clientLog := filepath.Join(t.TempDir(), "tcp-status-client.log")
 
@@ -803,6 +803,7 @@ func startXTunnel(t *testing.T, ctx context.Context, binPath, logPath string, ar
 		t.Fatalf("create log file: %v", err)
 	}
 	t.Cleanup(func() { _ = logFile.Close() })
+	releaseReservedPorts()
 	cmd := exec.CommandContext(ctx, binPath, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -819,6 +820,7 @@ func startXTunnel(t *testing.T, ctx context.Context, binPath, logPath string, ar
 
 func runXTunnelExpectStartupFailure(t *testing.T, ctx context.Context, binPath string, args []string, wants ...string) {
 	t.Helper()
+	releaseReservedPorts()
 	cmd := exec.CommandContext(ctx, binPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
@@ -847,14 +849,151 @@ func stopProcess(proc *xtunnelProcess) {
 	}
 }
 
-func freeTCPAddr(t *testing.T) string {
+// 测试端口分配。旧实现是 bind(:0) → close → 把端口交给被测进程再 bind，
+// 中间的窗口会被同机并发测试的出站连接抢走，被测进程 bind 失败后 exit 3
+// （v0.5.4 tag CI run 36450765406 就是这么红的）。现在堵两层：
+//  1. 只从测试专用段取端口，避开内核临时端口池——出站 connect 拿不到，
+//     同机其他测试进程也就抢不走；
+//  2. 端口交给子进程前一直被本进程的监听句柄占着（reserveTCPAddr），
+//     拉起子进程前才统一交出去（releaseReservedPorts）。
+const (
+	testPortFallbackLow  = 20000
+	testPortFallbackHigh = 30000
+)
+
+var (
+	portMu       sync.Mutex
+	portCursor   int
+	portReserved = map[string]net.Listener{}
+)
+
+// 测试端口段：Linux 读 /proc 让出整个临时端口池，其余平台用兜底段
+// （各平台默认临时端口段都不低于 32768）。
+var testPortLow, testPortHigh = func() (int, int) {
+	raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		return testPortFallbackLow, testPortFallbackHigh
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) != 2 {
+		return testPortFallbackLow, testPortFallbackHigh
+	}
+	ephemeralLow, err := strconv.Atoi(fields[0])
+	if err != nil || ephemeralLow <= testPortFallbackLow {
+		return testPortFallbackLow, testPortFallbackHigh
+	}
+	return testPortFallbackLow, ephemeralLow - 1
+}()
+
+// claimTestPort 在测试端口段里找一个能绑的端口并占住，返回地址与监听句柄。
+// 段内端口被占（别的进程，或本进程上一轮没交出去的预留）就换下一个。
+func claimTestPort(t *testing.T) (string, net.Listener) {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	portMu.Lock()
+	defer portMu.Unlock()
+	low, high := testPortLow, testPortHigh
+	for i := 0; i < high-low; i++ {
+		port := low + (portCursor+i)%(high-low)
+		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		portCursor = (portCursor + i + 1) % (high - low)
+		return ln.Addr().String(), ln
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0") // 兜底：测试段被占满
 	if err != nil {
 		t.Fatalf("find free port: %v", err)
 	}
-	defer l.Close()
-	return l.Addr().String()
+	return ln.Addr().String(), ln
+}
+
+// reserveTCPAddr 取一个已占住、尚未交接的地址，供子进程 bind。
+func reserveTCPAddr(t *testing.T) string {
+	t.Helper()
+	addr, ln := claimTestPort(t)
+	portMu.Lock()
+	portReserved[addr] = ln
+	portMu.Unlock()
+	t.Cleanup(func() { releaseTCPAddr(addr) })
+	return addr
+}
+
+// inProcessTCPAddr 给被测进程自己（同一个测试进程内）bind 的监听用：
+// 端口同样取自测试段，调用方紧接着就 bind，没有子进程交接这回事。
+func inProcessTCPAddr(t *testing.T) string {
+	t.Helper()
+	addr, ln := claimTestPort(t)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release port %s: %v", addr, err)
+	}
+	return addr
+}
+
+func releaseTCPAddr(addr string) {
+	portMu.Lock()
+	defer portMu.Unlock()
+	if ln, ok := portReserved[addr]; ok {
+		delete(portReserved, addr)
+		_ = ln.Close()
+	}
+}
+
+// releaseReservedPorts 交出所有预留端口，交接窗口缩到 exec 前一瞬。
+// 不按命令行挑：地址也可能经配置文件传给子进程，按参数挑会漏。
+// 提前交出用不到的端口也不要紧——测试端口段没人抢，多撑一会儿不亏。
+func releaseReservedPorts() {
+	portMu.Lock()
+	defer portMu.Unlock()
+	for addr, ln := range portReserved {
+		delete(portReserved, addr)
+		_ = ln.Close()
+	}
+}
+
+// TestReserveTCPAddr 覆盖交接窗口的三条性质：预留即占住（外部 bind 必失败）、
+// 段内端口被抢占时改用下一个、交接后才重新可绑。另锁一条：测试端口不得落进内核
+// 临时端口池——那正是 v0.5.4 tag CI 打红时端口被抢走的来源。
+func TestReserveTCPAddr(t *testing.T) {
+	addr := reserveTCPAddr(t)
+	if ln, err := net.Listen("tcp", addr); err == nil {
+		_ = ln.Close()
+		t.Fatalf("预留端口 %s 交接前就能被别的监听占住，close→reuse 窗口仍在", addr)
+	}
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split reserved addr: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse reserved port: %v", err)
+	}
+	if raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
+		if fields := strings.Fields(string(raw)); len(fields) == 2 {
+			if ephemeralLow, err := strconv.Atoi(fields[0]); err == nil && port >= ephemeralLow {
+				t.Fatalf("测试端口 %d 落在临时端口池 [%d,+∞) 内，会被出站连接抢走", port, ephemeralLow)
+			}
+		}
+	}
+
+	portMu.Lock()
+	next := testPortLow + portCursor%(testPortHigh-testPortLow)
+	portMu.Unlock()
+	blocker, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(next)))
+	if err != nil {
+		t.Fatalf("抢占端口 %d 失败: %v", next, err)
+	}
+	defer blocker.Close()
+	if other := reserveTCPAddr(t); strings.HasSuffix(other, ":"+strconv.Itoa(next)) {
+		t.Fatalf("端口 %d 已被占用仍被分配出去: %s", next, other)
+	}
+
+	releaseReservedPorts()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("交接后端口 %s 仍不可绑: %v", addr, err)
+	}
+	_ = ln.Close()
 }
 
 func waitTCP(t *testing.T, ctx context.Context, addr string, procs ...*xtunnelProcess) {
@@ -2116,8 +2255,8 @@ func TestIntegrationV3TunnelSmoke(t *testing.T) {
 	targetAddr := strings.TrimPrefix(origin.URL, "http://")
 
 	binPath := buildIntegrationBinary(t, ctx)
-	wsAddr := freeTCPAddr(t)
-	socksAddr := freeTCPAddr(t)
+	wsAddr := reserveTCPAddr(t)
+	socksAddr := reserveTCPAddr(t)
 
 	serverLog := filepath.Join(t.TempDir(), "server.log")
 	clientLog := filepath.Join(t.TempDir(), "client.log")
