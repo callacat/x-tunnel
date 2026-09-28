@@ -116,6 +116,9 @@ Wire and TLS parameters:
   server deployments.
 - `-server-ip` / `DialOptions.TargetIP` forces the dial address to a specific
   IP while keeping the configured TLS `ServerName` for the certificate check.
+  Accepts `IP`, `IP:port`, hostname or `hostname:port` (same semantics on TCP
+  and QUIC). Dial port precedence: an explicit port on `-ip` wins, otherwise
+  `-quic-port`, otherwise the resolved server port (default `443`).
 
 Connection management defaults (`quic.Config`):
 
