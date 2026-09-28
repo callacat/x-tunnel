@@ -139,28 +139,7 @@ func (t *QuicTransport) DialSession(ctx context.Context, rawAddr string, opts Di
 		tlsConf.NextProtos = []string{DefaultALPN}
 	}
 
-	targetAddr := rawAddr
-	// Strip scheme if present (e.g., "https://host:port" or "wss://host:port" -> "host:port")
-	if strings.Contains(targetAddr, "://") {
-		parts := strings.SplitN(targetAddr, "://", 2)
-		targetAddr = parts[1]
-	}
-	if slashIdx := strings.Index(targetAddr, "/"); slashIdx != -1 {
-		targetAddr = targetAddr[:slashIdx]
-	}
-
-	host, port, err := net.SplitHostPort(targetAddr)
-	if err != nil {
-		host = targetAddr
-		port = "443"
-		targetAddr = net.JoinHostPort(host, port)
-	}
-
-	// QUIC 独立监听端口：服务端分端口部署时客户端拨号端口与主端口不同
-	if opts.QUICPort > 0 {
-		port = strconv.Itoa(opts.QUICPort)
-		targetAddr = net.JoinHostPort(host, port)
-	}
+	targetAddr, host := resolveQUICDialTarget(rawAddr, opts.TargetIP, opts.QUICPort)
 
 	if tlsConf.ServerName == "" {
 		if opts.ServerName != "" {
@@ -168,10 +147,6 @@ func (t *QuicTransport) DialSession(ctx context.Context, rawAddr string, opts Di
 		} else {
 			tlsConf.ServerName = host
 		}
-	}
-
-	if opts.TargetIP != "" {
-		targetAddr = net.JoinHostPort(opts.TargetIP, port)
 	}
 
 	maxIdleTimeout := opts.MaxIdleTimeout
@@ -211,6 +186,33 @@ func (t *QuicTransport) DialSession(ctx context.Context, rawAddr string, opts Di
 	}
 
 	return NewQuicTransportSession(conn), nil
+}
+
+// resolveQUICDialTarget 解析 QUIC 实拨地址，第二个返回值是未受 -ip 影响的原始 host，
+// 供 TLS SNI 使用：SNI 必须取自用户请求的域名，不能被拨号 IP 污染。
+// 端口优先级：-ip 显式带端口 > quicPort（QUIC 独立监听端口）> 目标地址自带端口（缺省 443）。
+func resolveQUICDialTarget(rawAddr, targetIP string, quicPort int) (string, string) {
+	addr := rawAddr
+	// Strip scheme if present (e.g., "https://host:port" or "wss://host:port" -> "host:port")
+	if strings.Contains(addr, "://") {
+		parts := strings.SplitN(addr, "://", 2)
+		addr = parts[1]
+	}
+	if slashIdx := strings.Index(addr, "/"); slashIdx != -1 {
+		addr = addr[:slashIdx]
+	}
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = strings.Trim(addr, "[]")
+		port = "443"
+	}
+
+	dialAddr := net.JoinHostPort(host, port)
+	if quicPort > 0 {
+		dialAddr = net.JoinHostPort(host, strconv.Itoa(quicPort))
+	}
+	return resolveDialTarget(dialAddr, targetIP), host
 }
 
 func (t *QuicTransport) Listen(ctx context.Context, addr string, opts ListenOptions) (TransportListener, error) {

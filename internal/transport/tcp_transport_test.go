@@ -64,8 +64,8 @@ func TestResolveTCPDialTarget(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveTCPDialTarget(tc.addr, tc.targetIP); got != tc.want {
-				t.Fatalf("resolveTCPDialTarget(%q, %q) = %q, want %q", tc.addr, tc.targetIP, got, tc.want)
+			if got := resolveDialTarget(tc.addr, tc.targetIP); got != tc.want {
+				t.Fatalf("resolveDialTarget(%q, %q) = %q, want %q", tc.addr, tc.targetIP, got, tc.want)
 			}
 		})
 	}

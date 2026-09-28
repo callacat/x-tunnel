@@ -303,7 +303,7 @@ func (t *TcpTransport) DialSession(ctx context.Context, rawURL string, opts Dial
 	if opts.TargetIP != "" {
 		base := dialer.NetDialContext
 		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			target := resolveTCPDialTarget(addr, opts.TargetIP)
+			target := resolveDialTarget(addr, opts.TargetIP)
 			if base != nil {
 				return base(ctx, network, target)
 			}
@@ -327,11 +327,13 @@ func (t *TcpTransport) DialSession(ctx context.Context, rawURL string, opts Dial
 	return NewTcpTransportSession(sess, wsNet), nil
 }
 
-// resolveTCPDialTarget 只改写 TCP 拨号目标。TLS SNI 与 WebSocket Host 头在 gorilla
-// 内部同样由 URL 派生（client.go req.Host / cfg.ServerName），故此处不得改写 u.Host，
-// 只劫持 NetDialContext 的入参即可让「实拨地址」与「SNI/Host」彻底解耦。
+// resolveDialTarget 解析 -ip（TargetIP）覆盖后的实拨地址，TCP 与 QUIC 共用同一语义：
+// targetIP 自带端口时原样使用，否则沿用目标地址的端口。
 // targetIP 支持 IP、IP:port、域名、域名:port、裸 IPv6 形态，与 config.validateDialIPOverride 一致。
-func resolveTCPDialTarget(addr, targetIP string) string {
+// TCP 侧 TLS SNI 与 WebSocket Host 头由 gorilla 从 URL 派生（client.go req.Host / cfg.ServerName），
+// QUIC 侧 SNI 取 resolveQUICDialTarget 返回的原始 host；两者都不得被 targetIP 改写，
+// 只改「实拨地址」，让实拨地址与 SNI/Host 彻底解耦。
+func resolveDialTarget(addr, targetIP string) string {
 	if targetIP == "" {
 		return addr
 	}
