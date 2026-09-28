@@ -299,6 +299,19 @@ func (t *TcpTransport) DialSession(ctx context.Context, rawURL string, opts Dial
 		dialer.TLSClientConfig.ServerName = opts.ServerName
 	}
 
+	// -ip 覆盖只作用于实拨地址；u 保持原样，故 SNI 与 Host 头仍取自 URL。
+	if opts.TargetIP != "" {
+		base := dialer.NetDialContext
+		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			target := resolveTCPDialTarget(addr, opts.TargetIP)
+			if base != nil {
+				return base(ctx, network, target)
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, target)
+		}
+	}
+
 	wsConn, _, err := dialer.DialContext(ctx, u.String(), opts.Header)
 	if err != nil {
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
@@ -312,6 +325,24 @@ func (t *TcpTransport) DialSession(ctx context.Context, rawURL string, opts Dial
 	}
 
 	return NewTcpTransportSession(sess, wsNet), nil
+}
+
+// resolveTCPDialTarget 只改写 TCP 拨号目标。TLS SNI 与 WebSocket Host 头在 gorilla
+// 内部同样由 URL 派生（client.go req.Host / cfg.ServerName），故此处不得改写 u.Host，
+// 只劫持 NetDialContext 的入参即可让「实拨地址」与「SNI/Host」彻底解耦。
+// targetIP 支持 IP、IP:port、域名、域名:port、裸 IPv6 形态，与 config.validateDialIPOverride 一致。
+func resolveTCPDialTarget(addr, targetIP string) string {
+	if targetIP == "" {
+		return addr
+	}
+	if _, _, err := net.SplitHostPort(targetIP); err == nil { // 已带端口，原样使用
+		return targetIP
+	}
+	_, port, err := net.SplitHostPort(addr) // gorilla 已按 scheme 补默认端口，必为 host:port
+	if err != nil {
+		return targetIP
+	}
+	return net.JoinHostPort(targetIP, port)
 }
 
 func (t *TcpTransport) Listen(ctx context.Context, addr string, opts ListenOptions) (TransportListener, error) {
