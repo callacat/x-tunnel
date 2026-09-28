@@ -270,15 +270,6 @@ func TestQuicDatagramRelayDirect(t *testing.T) {
 		t.Fatalf("payload = %s, want %s", string(respFrame.Payload), string(testMsg))
 	}
 }
-func freeUDPPort(t *testing.T) int {
-	t.Helper()
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	if err != nil {
-		t.Fatalf("find free udp port: %v", err)
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).Port
-}
 
 // TestQuicSeparatePortEndToEnd 验证服务端 -quic-port 分端口部署时，
 // 客户端通过同名参数将 QUIC 拨号指向独立端口（auto 直接 QUIC 就绪，quic-only 亦可连通）。
@@ -299,7 +290,7 @@ func TestQuicSeparatePortEndToEnd(t *testing.T) {
 
 	binPath := buildIntegrationBinary(t, ctx)
 	wssAddr := reserveTCPAddr(t)
-	quicPort := freeUDPPort(t)
+	quicPort := reserveUDPPort(t)
 	_, wssPort, err := net.SplitHostPort(wssAddr)
 	if err != nil {
 		t.Fatalf("split wss addr: %v", err)

@@ -803,7 +803,7 @@ func startXTunnel(t *testing.T, ctx context.Context, binPath, logPath string, ar
 		t.Fatalf("create log file: %v", err)
 	}
 	t.Cleanup(func() { _ = logFile.Close() })
-	releaseReservedPorts()
+	releaseReservedPorts(t)
 	cmd := exec.CommandContext(ctx, binPath, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -820,7 +820,7 @@ func startXTunnel(t *testing.T, ctx context.Context, binPath, logPath string, ar
 
 func runXTunnelExpectStartupFailure(t *testing.T, ctx context.Context, binPath string, args []string, wants ...string) {
 	t.Helper()
-	releaseReservedPorts()
+	releaseReservedPorts(t)
 	cmd := exec.CommandContext(ctx, binPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
@@ -855,68 +855,151 @@ func stopProcess(proc *xtunnelProcess) {
 //  1. 只从测试专用段取端口，避开内核临时端口池——出站 connect 拿不到，
 //     同机其他测试进程也就抢不走；
 //  2. 端口交给子进程前一直被本进程的监听句柄占着（reserveTCPAddr），
-//     拉起子进程前才统一交出去（releaseReservedPorts）。
+//     拉起子进程前才交出去（releaseReservedPorts，只交本用例的）。
 const (
-	testPortFallbackLow  = 20000
-	testPortFallbackHigh = 30000
+	testPortFallbackLow = 20000
+	testPortSpan        = 10000
+	testPortMinLow      = 1024 // 低于此需 root 才能绑
+	testPortMinSpan     = 1024
 )
 
 var (
-	portMu       sync.Mutex
-	portCursor   int
-	portReserved = map[string]net.Listener{}
+	portMu     sync.Mutex
+	portCursor int
+	// 预留表按 *testing.T 分桶：交端口只交本用例的。全包无 t.Parallel 时与
+	// 全局全交等价，但后人给任一用例加上 t.Parallel，一个用例的 startXTunnel
+	// 也就不会交走另一个用例刚预留的端口。
+	portReserved = map[*testing.T]map[string]io.Closer{}
 )
 
-// 测试端口段：Linux 读 /proc 让出整个临时端口池，其余平台用兜底段
-// （各平台默认临时端口段都不低于 32768）。
+// 测试端口段取不到合法段时置位，由 claimSegment 以 t 级错误报出——静默用一个
+// 落在临时端口池内的段，等于把 v0.5.4 那个根因原样放回来。
+var testPortRangeErr error
+
+// 测试端口段整段让开内核临时端口池，出站 connect 的临时端口分配就抢不到它。
 var testPortLow, testPortHigh = func() (int, int) {
-	raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
-	if err != nil {
-		return testPortFallbackLow, testPortFallbackHigh
-	}
-	fields := strings.Fields(string(raw))
-	if len(fields) != 2 {
-		return testPortFallbackLow, testPortFallbackHigh
-	}
-	ephemeralLow, err := strconv.Atoi(fields[0])
-	if err != nil || ephemeralLow <= testPortFallbackLow {
-		return testPortFallbackLow, testPortFallbackHigh
-	}
-	return testPortFallbackLow, ephemeralLow - 1
+	raw, _ := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range") // 非 Linux 读不到
+	low, high, err := resolveTestPortSegment(string(raw))
+	testPortRangeErr = err
+	return low, high
 }()
 
-// claimTestPort 在测试端口段里找一个能绑的端口并占住，返回地址与监听句柄。
+// resolveTestPortSegment 从 ip_local_port_range 原文推出测试端口段。临时池下界
+// 拿不到时按 32768 起算（各平台默认都不低于 32768）；池被管理员压到 20000
+// 以下时改取其下方同宽的一段；再压（合法端口都进了池）就报错交还调用方。
+func resolveTestPortSegment(raw string) (low, high int, err error) {
+	ephemeralLow := 32768
+	if f := strings.Fields(raw); len(f) == 2 {
+		if v, e := strconv.Atoi(f[0]); e == nil {
+			ephemeralLow = v
+		}
+	}
+	low, high = testPortFallbackLow, ephemeralLow-1
+	if low >= high { // 池压到 20000 附近，20000 起的一段没宽度了
+		low, high = ephemeralLow-testPortSpan, ephemeralLow-1
+	}
+	if low < testPortMinLow || high-low < testPortMinSpan {
+		return 0, 0, fmt.Errorf("ip_local_port_range=%q 时推不出测试端口段：%d 以下的可用段需 >= %d 宽且下界 >= %d；"+
+			"请把 net.ipv4.ip_local_port_range 调回默认 32768 60999",
+			strings.TrimSpace(raw), ephemeralLow, testPortMinSpan, testPortMinLow)
+	}
+	return low, high, nil
+}
+
+// claimSegment 在测试端口段里找一个能绑的端口并占住。
 // 段内端口被占（别的进程，或本进程上一轮没交出去的预留）就换下一个。
-func claimTestPort(t *testing.T) (string, net.Listener) {
+func claimSegment(t *testing.T, bind func(port int) (io.Closer, error)) io.Closer {
 	t.Helper()
+	if testPortRangeErr != nil {
+		t.Fatalf("测试端口段不可用: %v", testPortRangeErr)
+	}
 	portMu.Lock()
 	defer portMu.Unlock()
 	low, high := testPortLow, testPortHigh
 	for i := 0; i < high-low; i++ {
 		port := low + (portCursor+i)%(high-low)
-		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		c, err := bind(port)
 		if err != nil {
 			continue
 		}
 		portCursor = (portCursor + i + 1) % (high - low)
-		return ln.Addr().String(), ln
+		return c
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0") // 兜底：测试段被占满
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
+	// 不退回 bind(:0) 兜底：那正是内核临时端口池，等于无声放回根因。
+	t.Fatalf("测试端口段 [%d,%d) 已被占满", low, high)
+	return nil
+}
+
+// claimTestPort 段内占住一个 TCP 端口。
+func claimTestPort(t *testing.T) (string, net.Listener) {
+	t.Helper()
+	ln := claimSegment(t, func(port int) (io.Closer, error) {
+		return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	}).(net.Listener)
 	return ln.Addr().String(), ln
+}
+
+// claimTestUDPPort 段内占住一个 UDP 端口——UDP 端口同样落内核临时端口池。
+func claimTestUDPPort(t *testing.T) *net.UDPConn {
+	t.Helper()
+	return claimSegment(t, func(port int) (io.Closer, error) {
+		return net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+	}).(*net.UDPConn)
+}
+
+// claimBlockerPort 从 cursor 指向处起向后探测第一个能绑的端口占住，供用例抢占。
+// 段内端口未必可绑（常驻服务在听，本机 21940 就常年占着），硬取 cursor 那一个
+// 会误红——这正是「修 flake 的用例自己带 flake」的形态。
+func claimBlockerPort(t *testing.T) (int, net.Listener) {
+	t.Helper()
+	if testPortRangeErr != nil {
+		t.Fatalf("测试端口段不可用: %v", testPortRangeErr)
+	}
+	portMu.Lock()
+	low, high := testPortLow, testPortHigh
+	start := low + portCursor%(high-low)
+	portMu.Unlock()
+	for i := 0; i < high-low; i++ {
+		port := low + (start+i)%(high-low)
+		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		return port, ln
+	}
+	t.Skipf("测试端口段 [%d,%d) 全被占满，跳过抢占用例", low, high)
+	return 0, nil
+}
+
+// reservePort 把占住的句柄挂进本用例的预留桶，等交接或用例结束时释放。
+func reservePort(t *testing.T, key string, c io.Closer) {
+	t.Helper()
+	portMu.Lock()
+	bucket := portReserved[t]
+	if bucket == nil {
+		bucket = map[string]io.Closer{}
+		portReserved[t] = bucket
+	}
+	bucket[key] = c
+	portMu.Unlock()
+	t.Cleanup(func() { releasePort(t, key) })
 }
 
 // reserveTCPAddr 取一个已占住、尚未交接的地址，供子进程 bind。
 func reserveTCPAddr(t *testing.T) string {
 	t.Helper()
 	addr, ln := claimTestPort(t)
-	portMu.Lock()
-	portReserved[addr] = ln
-	portMu.Unlock()
-	t.Cleanup(func() { releaseTCPAddr(addr) })
+	reservePort(t, "tcp "+addr, ln)
 	return addr
+}
+
+// reserveUDPPort 取一个已占住、尚未交接的 UDP 端口，供子进程 bind。
+func reserveUDPPort(t *testing.T) int {
+	t.Helper()
+	conn := claimTestUDPPort(t)
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	reservePort(t, "udp "+strconv.Itoa(port), conn)
+	return port
 }
 
 // inProcessTCPAddr 给被测进程自己（同一个测试进程内）bind 的监听用：
@@ -930,24 +1013,26 @@ func inProcessTCPAddr(t *testing.T) string {
 	return addr
 }
 
-func releaseTCPAddr(addr string) {
+func releasePort(t *testing.T, key string) {
 	portMu.Lock()
 	defer portMu.Unlock()
-	if ln, ok := portReserved[addr]; ok {
-		delete(portReserved, addr)
-		_ = ln.Close()
+	bucket := portReserved[t]
+	if c, ok := bucket[key]; ok {
+		delete(bucket, key)
+		_ = c.Close()
 	}
 }
 
-// releaseReservedPorts 交出所有预留端口，交接窗口缩到 exec 前一瞬。
+// releaseReservedPorts 交出本用例的全部预留，交接窗口缩到 exec 前一瞬。
+// 按 *testing.T 分桶而非全局全交：把「全包无 t.Parallel」这条前提变成结构约束。
 // 不按命令行挑：地址也可能经配置文件传给子进程，按参数挑会漏。
 // 提前交出用不到的端口也不要紧——测试端口段没人抢，多撑一会儿不亏。
-func releaseReservedPorts() {
+func releaseReservedPorts(t *testing.T) {
 	portMu.Lock()
 	defer portMu.Unlock()
-	for addr, ln := range portReserved {
-		delete(portReserved, addr)
-		_ = ln.Close()
+	for key, c := range portReserved[t] {
+		delete(portReserved[t], key)
+		_ = c.Close()
 	}
 }
 
@@ -976,24 +1061,119 @@ func TestReserveTCPAddr(t *testing.T) {
 		}
 	}
 
-	portMu.Lock()
-	next := testPortLow + portCursor%(testPortHigh-testPortLow)
-	portMu.Unlock()
-	blocker, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(next)))
-	if err != nil {
-		t.Fatalf("抢占端口 %d 失败: %v", next, err)
-	}
+	next, blocker := claimBlockerPort(t)
 	defer blocker.Close()
 	if other := reserveTCPAddr(t); strings.HasSuffix(other, ":"+strconv.Itoa(next)) {
 		t.Fatalf("端口 %d 已被占用仍被分配出去: %s", next, other)
 	}
 
-	releaseReservedPorts()
+	releaseReservedPorts(t)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		t.Fatalf("交接后端口 %s 仍不可绑: %v", addr, err)
 	}
 	_ = ln.Close()
+}
+
+// TestResolveTestPortSegment 锁住「测试端口段永不落进内核临时端口池」：池被压到
+// 20000 以下时改取其下方的段，再压（合法端口全进了池）就报错交还 t 级失败。
+func TestResolveTestPortSegment(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		raw               string
+		wantLow, wantHigh int
+		wantErr           bool
+	}{
+		{name: "Linux 默认", raw: "32768\t60999\n", wantLow: 20000, wantHigh: 32767},
+		{name: "非 Linux 读不到 /proc", raw: "", wantLow: 20000, wantHigh: 32767},
+		{name: "内容不合法", raw: "garbage", wantLow: 20000, wantHigh: 32767},
+		{name: "池压到 20000", raw: "20000 65535", wantLow: 10000, wantHigh: 19999},
+		{name: "池压到 1024 无合法段", raw: "1024 65535", wantErr: true},
+		{name: "池压到 0", raw: "0 65535", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			low, high, err := resolveTestPortSegment(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ip_local_port_range=%q 推出段 [%d,%d]，整段落进池内仍静默放行", tc.raw, low, high)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveTestPortSegment(%q): %v", tc.raw, err)
+			}
+			if low != tc.wantLow || high != tc.wantHigh {
+				t.Fatalf("段 = [%d,%d], want [%d,%d]", low, high, tc.wantLow, tc.wantHigh)
+			}
+			if f := strings.Fields(tc.raw); len(f) == 2 {
+				if ephemeralLow, e := strconv.Atoi(f[0]); e == nil && high >= ephemeralLow {
+					t.Fatalf("段上界 %d 落进临时端口池 [%d,+∞)", high, ephemeralLow)
+				}
+			}
+		})
+	}
+}
+
+// TestReserveUDPPort UDP 侧与 TCP 侧同一套预留：占住直到交接，旧实现
+// bind(:0)→close→交端口 的 TOCTOU 窗口原样留在 UDP 上。
+func TestReserveUDPPort(t *testing.T) {
+	port := reserveUDPPort(t)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	if c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}); err == nil {
+		_ = c.Close()
+		t.Fatalf("预留的 UDP 端口 %d 交接前就能被别的套接字占住，close→reuse 窗口仍在", port)
+	}
+	releaseReservedPorts(t)
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+	if err != nil {
+		t.Fatalf("交接后 UDP 端口 %s 仍不可绑: %v", addr, err)
+	}
+	_ = c.Close()
+}
+
+// TestClaimBlockerPortSkipsOccupied 覆盖抢占探测那一步自身的 flake 源：把 cursor
+// 指向的端口占住（等价于常驻服务在听），探测必须往后找下一个而不是硬取它。
+func TestClaimBlockerPortSkipsOccupied(t *testing.T) {
+	_ = reserveTCPAddr(t) // 推进 cursor，让下一个就是下面要占住的那个
+	portMu.Lock()
+	want := testPortLow + portCursor%(testPortHigh-testPortLow)
+	portMu.Unlock()
+	squatter, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(want)))
+	if err != nil {
+		t.Skipf("端口 %d 本就被别的进程占着，正是要测的形态: %v", want, err)
+	}
+	defer squatter.Close()
+	got, blocker := claimBlockerPort(t)
+	defer blocker.Close()
+	if got == want {
+		t.Fatalf("端口 %d 被占住仍被当空端口交出去，抢占探测形同虚设", want)
+	}
+}
+
+// TestReservedPortsBucketedByTest 把「全包无 t.Parallel」从注释前提变成结构约束：
+// 一个用例交端口不得动另一个用例的预留（老实现是无条件全交，加了 t.Parallel 就互踩）。
+func TestReservedPortsBucketedByTest(t *testing.T) {
+	reserved, checked := make(chan struct{}), make(chan struct{})
+	t.Run("holder", func(t *testing.T) {
+		t.Parallel()
+		held := reserveTCPAddr(t)
+		close(reserved)
+		<-checked
+		if ln, err := net.Listen("tcp", held); err == nil {
+			_ = ln.Close()
+			t.Errorf("别的用例交接端口时把本用例预留的 %s 放了出来", held)
+		}
+	})
+	t.Run("releaser", func(t *testing.T) {
+		t.Parallel()
+		mine := reserveTCPAddr(t)
+		<-reserved
+		releaseReservedPorts(t)
+		close(checked)
+		if _, err := net.Listen("tcp", mine); err != nil {
+			t.Errorf("本用例交接后 %s 仍不可绑: %v", mine, err)
+		}
+	})
 }
 
 func waitTCP(t *testing.T, ctx context.Context, addr string, procs ...*xtunnelProcess) {
