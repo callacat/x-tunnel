@@ -47,7 +47,9 @@ jobs:
         run: go test -run '^$' -fuzz FuzzParseSOCKS5UDPPacket -fuzztime=2s -parallel=1 ./internal/app
 
       - name: Build
-        run: go build -o x-tunnel ./cmd/x-tunnel
+        run: |
+          go build -o x-tunnel ./cmd/x-tunnel
+          go build -o baidu-socks5 ./cmd/baidu-socks5
 
       - name: Build script smoke
         run: |

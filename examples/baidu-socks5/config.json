@@ -1,0 +1,17 @@
+{
+  "listen": "0.0.0.0:10811",
+  "dial_timeout": "10s",
+  "handshake_timeout": "15s",
+  "front_proxy": {
+    "enabled": true,
+    "type": "http_connect",
+    "server": "cloudnproxy.baidu.com:443",
+    "connect_host": "sptest.baidu.com",
+    "headers": {
+      "X-T5-Auth": "<PLACEHOLDER: 从运维/密钥通道取得，配置文件权限 0600，不要提交进仓库>",
+      "User-Agent": "okhttp/3.11.0 Dalvik/2.1.0 (Linux; Build/RKQ1.200826.002) baiduboxapp/11.0.5.12 (Baidu; P1 11)",
+      "Proxy-Connection": "keep-alive",
+      "Connection": "keep-alive"
+    }
+  }
+}

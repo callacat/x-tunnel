@@ -121,7 +121,13 @@ func isHTTPToken(value string) bool {
 }
 
 func dialWebSocketFrontProxy(ctx context.Context, target string) (net.Conn, error) {
-	config := websocketFrontProxyConfig
+	return dialHTTPConnectFrontProxy(ctx, websocketFrontProxyConfig, target, cfg.DialTimeout, cfg.WSHandshakeTimeout)
+}
+
+// dialHTTPConnectFrontProxy 经 HTTP CONNECT 前置代理连到 target。前置代理既可以是
+// 隧道服务端自身的 websocket 前置，也可以是任意 HTTP CONNECT 代理（例如百度云代理
+// cloudnproxy），只要它接受 CONNECT <target> 并在 200 后做字节透传。
+func dialHTTPConnectFrontProxy(ctx context.Context, config WebSocketFrontProxyConfig, target string, dialTimeout, handshakeTimeout time.Duration) (net.Conn, error) {
 	if !config.Enabled {
 		return nil, fmt.Errorf("websocket front proxy is disabled")
 	}
@@ -132,7 +138,7 @@ func dialWebSocketFrontProxy(ctx context.Context, target string) (net.Conn, erro
 		return nil, fmt.Errorf("websocket front proxy target is empty")
 	}
 
-	dialer := net.Dialer{Timeout: cfg.DialTimeout}
+	dialer := net.Dialer{Timeout: dialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", config.Server)
 	if err != nil {
 		return nil, fmt.Errorf("dial websocket front proxy %s: %w", config.Server, err)
@@ -144,9 +150,9 @@ func dialWebSocketFrontProxy(ctx context.Context, target string) (net.Conn, erro
 		}
 	}()
 
-	deadline := time.Now().Add(cfg.WSHandshakeTimeout)
-	if cfg.WSHandshakeTimeout <= 0 {
-		deadline = time.Now().Add(cfg.DialTimeout)
+	deadline := time.Now().Add(handshakeTimeout)
+	if handshakeTimeout <= 0 {
+		deadline = time.Now().Add(dialTimeout)
 	}
 	if !deadline.IsZero() {
 		_ = conn.SetDeadline(deadline)
@@ -196,4 +202,12 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 		return c.reader.Read(p)
 	}
 	return c.Conn.Read(p)
+}
+
+// CloseWrite 透传给底层连接（隧道透传结束后要半关闭对端，bufferedConn 不能吞掉）。
+func (c *bufferedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
