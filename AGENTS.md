@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Go 1.25 tunnel/proxy project (module `x-tunnel`).
+This is a Go 1.26 tunnel/proxy project (module `x-tunnel`).
 
 - `cmd/main.go` — CLI entrypoint.
 - `internal/app/` — application wiring: engine, client/server, front proxy, SOCKS5/HTTP local listeners, control plane, keepalive, pacing, TLS ECH/DNS.

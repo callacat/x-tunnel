@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG GO_VERSION=1.25.5
+ARG GO_VERSION=1.26.10
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 
@@ -16,6 +16,9 @@ ARG TARGETARCH
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
+
+# go version 打日志：构建日志留工具链版本证据（CVE-2026-111943 要求 ≥1.26.10）
+RUN go version
 
 RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" go build \
     -trimpath \
