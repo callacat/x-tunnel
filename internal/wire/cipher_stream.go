@@ -181,17 +181,27 @@ func NewV3CipherStream(inner io.ReadWriteCloser, keys V3SessionKeys, cipherID by
 	return s, nil
 }
 
-func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
+// coalesceWriteThreshold is the buffered ciphertext size at which the
+// non-delay write path flushes to the underlying smux stream mid-write.
+// ponytail: larger smux frames = fewer WS messages per byte; keep below the
+// gorilla WebSocket max message size (64KB) so a frame always fits one message.
+const coalesceWriteThreshold = 32 * 1024
+
+// sealRecord encrypts plain into one AEAD record and returns the record bytes.
+// It does not write to the underlying connection; callers coalesce multiple
+// records into fewer, larger writes. Per-record AEAD, nonce, counter and
+// padding are unchanged, so wire-level anti-fingerprinting is preserved.
+func (s *V3CipherStream) sealRecord(plain []byte) ([]byte, error) {
 	plainLen := len(plain)
 	if plainLen == 0 {
-		return nil
+		return nil, nil
 	}
 	if plainLen > maxV3RecordPlaintext {
-		return fmt.Errorf("plaintext length %d exceeds maximum record plaintext %d", plainLen, maxV3RecordPlaintext)
+		return nil, fmt.Errorf("plaintext length %d exceeds maximum record plaintext %d", plainLen, maxV3RecordPlaintext)
 	}
 
 	if s.writeCounter == math.MaxUint64 {
-		return fmt.Errorf("write counter overflow")
+		return nil, fmt.Errorf("write counter overflow")
 	}
 	s.writeCounter++
 	counter := s.writeCounter
@@ -204,11 +214,11 @@ func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
 	if s.writeAEAD == nil || gen != s.writeGen {
 		key, err := s.keys.StreamKey(s.cipherID, s.writeC2S, s.streamID, gen)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		aead, err := newAEAD(s.cipherID, key)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		s.writeAEAD = aead
 		s.writeGen = gen
@@ -231,8 +241,6 @@ func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
 	}
 
 	// 12-byte header: counter (8B BE) | payload_len (2B BE) | reserved (2B, zero).
-	// The true plaintext length lives inside the AEAD-encrypted envelope so
-	// padding cannot be adjusted away by an observer of the header.
 	binary.BigEndian.PutUint64(s.writeBuf[0:8], counter)
 	binary.BigEndian.PutUint16(s.writeBuf[8:10], uint16(payloadLen))
 	binary.BigEndian.PutUint16(s.writeBuf[10:12], 0)
@@ -257,7 +265,20 @@ func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
 	sealed := s.writeAEAD.Seal(s.writeBuf[v3RecordHeaderSize:v3RecordHeaderSize], nonce[:], s.writePayloadBuf[:payloadLen], ad)
 	recordBytes := s.writeBuf[:v3RecordHeaderSize+len(sealed)]
 
-	_, err := s.inner.Write(recordBytes)
+	record := make([]byte, len(recordBytes))
+	copy(record, recordBytes)
+	return record, nil
+}
+
+func (s *V3CipherStream) writeRecordLocked(plain []byte) error {
+	record, err := s.sealRecord(plain)
+	if err != nil {
+		return err
+	}
+	if len(record) == 0 {
+		return nil
+	}
+	_, err = s.inner.Write(record)
 	return err
 }
 
@@ -301,23 +322,38 @@ func (s *V3CipherStream) Write(p []byte) (int, error) {
 	}
 
 	if s.CoalesceDelay <= 0 {
-		if len(s.coalesceBuf) > 0 {
-			if err := s.flushCoalesceBufLocked(); err != nil {
-				return 0, err
-			}
-		}
 		totalWritten := 0
+		var buf []byte
+		flush := func() error {
+			if len(buf) == 0 {
+				return nil
+			}
+			_, err := s.inner.Write(buf)
+			buf = buf[:0]
+			return err
+		}
 		for len(p) > 0 {
 			chunkSize := len(p)
 			if chunkSize > maxV3RecordPlaintext {
 				chunkSize = maxV3RecordPlaintext
 			}
-			chunk := p[:chunkSize]
-			if err := s.writeRecordLocked(chunk); err != nil {
+			record, err := s.sealRecord(p[:chunkSize])
+			if err != nil {
 				return totalWritten, err
+			}
+			if len(record) > 0 {
+				buf = append(buf, record...)
+				if len(buf) >= coalesceWriteThreshold {
+					if err := flush(); err != nil {
+						return totalWritten, err
+					}
+				}
 			}
 			totalWritten += chunkSize
 			p = p[chunkSize:]
+		}
+		if err := flush(); err != nil {
+			return totalWritten, err
 		}
 		return totalWritten, nil
 	}
